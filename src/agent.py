@@ -5,8 +5,6 @@ import re
 import textwrap
 from datetime import datetime
 from pathlib import Path
-
-import pandas as pd
 from dateutil import parser as dateutil_parser
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -25,6 +23,7 @@ from livekit.agents.llm import ChatContext
 from livekit.plugins import ai_coustics, sarvam, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from openpyxl import load_workbook
+
 
 logger = logging.getLogger("agent")
 
@@ -79,34 +78,58 @@ def _format_date(value) -> str:
     """Format a due date as e.g. '15 June'."""
     if _is_missing(value):
         return "N/A"
+    if isinstance(value, datetime):
+        return f"{value.day} {value.strftime('%B')}"
     try:
-        dt = pd.to_datetime(value)
+        dt = dateutil_parser.parse(str(value), dayfirst=True, fuzzy=True)
         return f"{dt.day} {dt.strftime('%B')}"
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return str(value).strip()
 
 
 def _load_customer_context(path: Path) -> str:
-    """Build CUSTOMER_CONTEXT from the first data row of the Excel sheet."""
-    # The sheet has a title banner above the real header row, so locate the row
-    # that holds the column names before parsing.
-    raw = pd.read_excel(path, header=None)
-    header_row = 0
-    for i, sheet_row in raw.iterrows():
-        labels = [str(v).strip().lower() for v in sheet_row.tolist()]
-        if "customer name" in labels:
-            header_row = i
+    """Build CUSTOMER_CONTEXT from the second data row of the Excel sheet.
+
+    Single streaming pass with openpyxl (read_only) instead of two full
+    pandas parses -- keeps worker startup latency to a minimum.
+    """
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    worksheet = workbook.active
+
+    header_found = False
+    columns: dict[str, int] = {}
+    target_values: tuple | None = None
+    data_rows_seen = 0
+
+    for sheet_row in worksheet.iter_rows(values_only=True):
+        if not header_found:
+            labels = [str(v).strip().lower() for v in sheet_row if v is not None]
+            if "customer name" in labels:
+                header_found = True
+                columns = {
+                    str(v).strip().lower().replace(" ", "_"): idx
+                    for idx, v in enumerate(sheet_row)
+                    if v is not None
+                }
+            continue
+        data_rows_seen += 1
+        if data_rows_seen == 2:  # matches the previous df.iloc[1]
+            target_values = sheet_row
             break
 
-    df = pd.read_excel(path, header=header_row)
-    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+    workbook.close()
 
-    row = df.iloc[0]
+    if not header_found or target_values is None:
+        raise RuntimeError(f"Could not locate customer row in {path}")
+
+    def cell(col_name: str):
+        idx = columns.get(col_name)
+        return target_values[idx] if idx is not None and idx < len(target_values) else None
 
     name_parts = [
-        str(row[col]).strip()
+        str(cell(col)).strip()
         for col in ("customer_name", "last_name")
-        if col in row.index and not _is_missing(row[col])
+        if not _is_missing(cell(col))
     ]
     customer_name = " ".join(name_parts) or "Customer"
 
@@ -114,13 +137,13 @@ def _load_customer_context(path: Path) -> str:
     global LOADED_CUSTOMER_NAME
     LOADED_CUSTOMER_NAME = customer_name
 
-    loan_amount = _format_indian_amount(row.get("loan_amount"))
-    due_amount = _format_indian_amount(row.get("due_amount"))
-    due_date = _format_date(row.get("due_date"))
+    loan_amount = _format_indian_amount(cell("loan_amount"))
+    due_amount = _format_indian_amount(cell("due_amount"))
+    due_date = _format_date(cell("due_date"))
 
     # Lender is fully data-driven: whatever the sheet says, with a neutral
     # fallback so the prompt never references a hardcoded bank.
-    lender_value = row.get("lender_name")
+    lender_value = cell("lender_name")
     lender_name = "N/A" if _is_missing(lender_value) else str(lender_value).strip()
 
     return textwrap.dedent(f"""
@@ -734,14 +757,57 @@ A simple name confirmation is enough. Do not ask any additional verification que
 
 ================================================
 LANGUAGE
-========
+================================================
 
-* Match the customer's language naturally.
-* Hindi → Respond in Devanagari Hindi only.
-* English → Respond in English.
-* Hinglish → Respond primarily in Devanagari Hindi while allowing common business terms such as EMI, payment, account, due date, settlement, callback.
-* Start every call in natural Devanagari Hindi.
-* If language is unclear, continue in Devanagari Hindi.
+
+
+* Default language: Hinglish.
+
+* Default script:
+  - Use Devanagari for Hindi words.
+  - Use English for common BFSI and business terminology.
+  - Do not ask language preference. Switch permanently to English only when explicitly requested.
+
+* Hindi customer:
+  - Respond primarily in Hindi written in Devanagari.
+  - Use natural english BFSI terminology where appropriate.
+
+* English customer:
+
+  - Respond entirely in English.
+
+* Hinglish customer:
+  - Use natural Indian Hinglish.
+  - Write Hindi words in Devanagari and business terms in English.
+
+Examples:
+
+Correct:
+"नमस्ते राहुल जी।"
+
+Correct:
+"आपके personal loan account में payment due है।"
+
+Correct:
+"क्या आप payment आज कर पाएंगे?"
+
+Correct:
+"मैं callback request बना देती हूँ।"
+
+Correct:
+"क्या आप human agent से बात करना चाहेंगे?"
+
+Avoid overly formal Hindi.
+
+Incorrect:
+"मैं पुनर्भुगतान संग्रहण विभाग से बोल रही हूँ।"
+
+Incorrect:
+"आपका ऋण खाता बकाया है।"
+
+* Do not ask the customer which language they prefer.
+* Start every call in natural Hindi/Hinglish.
+* If language is unclear, continue in Hindi/Hinglish.
 * Never write Hindi in Roman script.
 * Speak only Hindi, Hinglish, or English.
 
@@ -813,6 +879,35 @@ Resolve relative dates such as:
 into absolute DD-MM-YYYY dates before calling tools.
 
 ================================================
+INDIAN DATE INTERPRETATION
+================================================
+
+Customers may express payment dates informally.
+
+Examples:
+
+"कल"
+"परसों"
+"अगले सोमवार"
+"अगले हफ्ते"
+"महीने की 5 तारीख"
+"salary आते ही"
+
+Interpret these naturally in conversation.
+
+Before recording a Promise To Pay, always confirm the exact payment date if there is any ambiguity.
+
+Example:
+
+Customer:
+"परसों कर दूँगा।"
+
+Agent:
+"जी, पुष्टि कर दूँ — क्या आप 24 जून को payment करेंगे?"
+
+Only record a Promise To Pay after the customer confirms the specific date.
+
+================================================
 TOOL FAILURE HANDLING
 =====================
 
@@ -850,6 +945,8 @@ You may occasionally use natural fillers such as:
 * समझ गई
 * ठीक है
 * बिलकुल
+
+Do not use pure Hindi words like pushti or samjhauta; use natural Hinglish instead.
 
 Do not overuse them.
 
@@ -1173,7 +1270,12 @@ server = AgentServer()
 
 
 def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
+    proc.userdata["vad"] = silero.VAD.load(
+        min_speech_duration=0.045,      # 100 
+        prefix_padding_duration=0.6,   # 200 ms speech pad
+        min_silence_duration=0.65,
+        activation_threshold=0.26,      # 200 ms silence pad
+    )
 
 
 server.setup_fnc = prewarm
@@ -1185,11 +1287,12 @@ async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
 
     session = AgentSession(
-        stt=inference.STT(model="deepgram/nova-3", language="multi"),
+          stt=sarvam.STT(model="saaras:v3", language="hi-IN", mode="transcribe", high_vad_sensitivity=True),
         tts=sarvam.TTS(
             target_language_code="hi-IN",
             model="bulbul:v3",
             speaker="ishita",
+            pace = 1.1,
         ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
