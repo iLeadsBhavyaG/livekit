@@ -659,6 +659,36 @@ def _transcript_from_history(history: ChatContext) -> str:
         lines.append(f"{'Customer' if role == 'user' else 'Agent'}: {text}")
     return "\n".join(lines)
 
+def _is_valid_hindi_text(text: str) -> bool:
+    """Check if transcribed text looks like Hindi/Hinglish, not garbage.
+    
+    Garbage indicators: text in Spanish, French, random Latin scripts that
+    aren't English + Hindi. Returns False if it looks like a bad STT output.
+    """
+    if not text or len(text.strip()) < 2:
+        return True  # too short to judge, allow it
+    
+    # Count scripts
+    devanagari_chars = sum(1 for c in text if '\u0900' <= c <= '\u097F')
+    latin_chars = sum(1 for c in text if c.isascii() and c.isalpha())
+    total_alpha = devanagari_chars + latin_chars
+    
+    if total_alpha == 0:
+        return True  # no letters, probably just punctuation/numbers
+    
+    # Hindi/Hinglish should have at least 20% Devanagari OR be mostly English
+    # If it's a mix with very little Devanagari, it's likely garbage (Spanish etc)
+    devanagari_ratio = devanagari_chars / total_alpha
+    latin_ratio = latin_chars / total_alpha
+    
+    if total_alpha > 5 and devanagari_ratio < 0.15 and latin_ratio < 0.85:
+        # Lots of text, almost no Devanagari, and not pure English either
+        logger.warning("Garbage STT detected: %r (%.1f%% Devanagari, %.1f%% Latin)", 
+                      text, devanagari_ratio * 100, latin_ratio * 100)
+        return False
+    
+    return True
+
 
 async def classify_and_save_outcome(history: ChatContext, customer_name: str) -> None:
     """Classify the finished call into exactly one outcome and persist it."""
@@ -724,7 +754,7 @@ async def classify_and_save_outcome(history: ChatContext, customer_name: str) ->
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
-            llm=inference.LLM(model="openai/gpt-5.2-chat-latest"),
+            llm=inference.LLM(model="openai/gpt-4o"),
             instructions=textwrap.dedent(f"""
 You are Priya, an experienced debt resolution specialist calling on behalf of a financial services company.
 
@@ -903,7 +933,9 @@ Customer:
 "परसों कर दूँगा।"
 
 Agent:
-"जी, पुष्टि कर दूँ — क्या आप 24 जून को payment करेंगे?"
+"जी, confirm कर दूँ — क्या आप 24 जून को payment करेंगे?"
+
+Do not use pure Hindi words like पुष्टि, use words like confirm, verify instead.
 
 Only record a Promise To Pay after the customer confirms the specific date.
 
@@ -1287,17 +1319,26 @@ async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
 
     session = AgentSession(
-          stt=sarvam.STT(model="saaras:v3", language="hi-IN", mode="transcribe", high_vad_sensitivity=True),
+        stt=sarvam.STT(model="saaras:v3", language="hi-IN", mode="transcribe", high_vad_sensitivity=True),
         tts=sarvam.TTS(
             target_language_code="hi-IN",
             model="bulbul:v3",
             speaker="ishita",
-            pace = 1.1,
+            pace=1.1,
         ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
     )
+
+    @session.on("user_speech")
+    def _intercept_garbage_stt(text: str):
+        """Reject garbage STT outputs (Spanish, etc) so the bot doesn't hang."""
+        if not _is_valid_hindi_text(text):
+            logger.error(">>> GARBAGE STT REJECTED: %r", text)
+            asyncio.create_task(session.say("Sorry, didn't catch that. Please repeat."))
+            return False  # block this utterance
+        return True  # valid, continue
 
     # Record the call outcome off the voice path, so no tool-call text can leak
     # to the customer. We kick it off on the session "close" event (fires ~2s
@@ -1342,7 +1383,7 @@ async def my_agent(ctx: JobContext):
         instructions=textwrap.dedent(f"""
 Start the call in Hindi.
 
-Introduce yourself as Priya from the financial services company.
+Introduce yourself as Priya from the alpha financial services company.
 
 Ask, by name, if you are speaking to {LOADED_CUSTOMER_NAME}
 (for example: "नमस्ते, क्या मेरी बात {LOADED_CUSTOMER_NAME} जी से हो रही है?").
