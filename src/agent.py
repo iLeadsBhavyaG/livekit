@@ -20,6 +20,7 @@ from livekit.agents import (
     room_io,
 )
 from livekit.agents.llm import ChatContext
+from livekit.agents.inference import TurnDetector
 from livekit.plugins import ai_coustics, sarvam, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from openpyxl import load_workbook
@@ -1326,7 +1327,7 @@ async def my_agent(ctx: JobContext):
             speaker="ishita",
             pace=1.1,
         ),
-        turn_detection=MultilingualModel(),
+        turn_detection=TurnDetector(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
     )
