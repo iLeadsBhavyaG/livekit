@@ -1,9 +1,78 @@
 import textwrap
+import types
 
 import pytest
 from livekit.agents import AgentSession, inference, llm
 
+import agent as agent_module
 from agent import Assistant
+
+
+@pytest.mark.asyncio
+async def test_record_ptp_speaks_ack_and_saves(monkeypatch) -> None:
+    """The PTP tool speaks an immediate acknowledgment and still saves
+    normalized English values, with the Excel write happening off the loop.
+
+    This guards the latency optimization: a short ack ("जी, ठीक है।") is
+    spoken the moment the tool runs so the customer isn't met with silence
+    while the spoken confirmation is still being generated.
+    """
+    saved: dict[str, str] = {}
+
+    def fake_save(name, amount, date, path=agent_module.CUSTOMER_DATA_FILE):
+        saved.update(name=name, amount=amount, date=date)
+        return True
+
+    monkeypatch.setattr(agent_module, "save_promise_to_pay", fake_save)
+    monkeypatch.setattr(agent_module, "LOADED_CUSTOMER_NAME", "Rahul")
+
+    said: list[str] = []
+
+    class _FakeSession:
+        def say(self, text, **kwargs):
+            said.append(text)
+            return object()
+
+    ctx = types.SimpleNamespace(session=_FakeSession())
+
+    raw = Assistant.record_promise_to_pay.__wrapped__
+    result = await raw(Assistant(), ctx, amount="पाँच हज़ार", date="25-06-2026")
+
+    # An immediate acknowledgment is spoken (masks the post-tool LLM round-trip).
+    assert said, "expected an immediate spoken acknowledgment before the save"
+    # Saved with normalized English values (Hindi words -> digits).
+    assert saved == {"name": "Rahul", "amount": "5000", "date": "25-06-2026"}
+    assert "saved" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_record_ptp_no_ack_when_values_unusable(monkeypatch) -> None:
+    """When amount/date cannot be understood, nothing is saved and no
+    premature acknowledgment is spoken."""
+    called = {"saved": False}
+
+    def fake_save(*args, **kwargs):
+        called["saved"] = True
+        return True
+
+    monkeypatch.setattr(agent_module, "save_promise_to_pay", fake_save)
+    monkeypatch.setattr(agent_module, "LOADED_CUSTOMER_NAME", "Rahul")
+
+    said: list[str] = []
+
+    class _FakeSession:
+        def say(self, text, **kwargs):
+            said.append(text)
+            return object()
+
+    ctx = types.SimpleNamespace(session=_FakeSession())
+
+    raw = Assistant.record_promise_to_pay.__wrapped__
+    result = await raw(Assistant(), ctx, amount="", date="")
+
+    assert not called["saved"], "must not save when values are missing"
+    assert not said, "must not acknowledge a promise that was not recorded"
+    assert "not saved" in result.lower()
 
 
 def _judge_llm() -> llm.LLM:

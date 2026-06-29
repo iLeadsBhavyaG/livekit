@@ -755,7 +755,7 @@ async def classify_and_save_outcome(history: ChatContext, customer_name: str) ->
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
-            llm=inference.LLM(model="openai/gpt-4o"),
+            llm=inference.LLM(model="openai/gpt-4.1-mini"),
             instructions=textwrap.dedent(f"""
 You are Priya, an experienced debt resolution specialist calling on behalf of a financial services company.
 
@@ -1287,7 +1287,16 @@ Your goal is to achieve a clear resolution and collect the next best action.
             )
             return "Promise to pay not saved: amount/date not understood."
 
-        saved = save_promise_to_pay(
+        # Speak a short acknowledgment the instant the tool runs, so the customer
+        # hears a response instead of silence while the model's spoken
+        # confirmation (a second LLM round-trip) is still being generated. Placed
+        # after validation so we never acknowledge an unusable promise.
+        context.session.say("जी, ठीक है।")
+
+        # Run the blocking Excel write off the event loop so audio is never
+        # stalled by file I/O.
+        saved = await asyncio.to_thread(
+            save_promise_to_pay,
             LOADED_CUSTOMER_NAME,
             clean_amount,
             clean_date,
@@ -1327,7 +1336,7 @@ async def my_agent(ctx: JobContext):
             speaker="ishita",
             pace=1.1,
         ),
-        turn_detection=TurnDetector(),
+        turn_detection=TurnDetector(version="v1-mini"),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
     )
@@ -1384,7 +1393,7 @@ async def my_agent(ctx: JobContext):
         instructions=textwrap.dedent(f"""
 Start the call in Hindi.
 
-Introduce yourself as Priya from the alpha financial services company.
+Introduce yourself as Priya from the Alpha financial services company.
 
 Ask, by name, if you are speaking to {LOADED_CUSTOMER_NAME}
 (for example: "नमस्ते, क्या मेरी बात {LOADED_CUSTOMER_NAME} जी से हो रही है?").
