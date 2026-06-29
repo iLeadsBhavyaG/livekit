@@ -1875,6 +1875,13 @@ async def my_agent(ctx: JobContext):
 
     await ctx.connect()
 
+    # Wait until the person is actually in the room before greeting. For the web
+    # app they're already present, so this returns immediately; for an outbound
+    # phone call it blocks until the callee answers (the SIP participant joins),
+    # so Priya never greets an empty room and the customer never picks up to
+    # silence.
+    await ctx.wait_for_participant()
+
     # FIRST SPEECH (STRICT CONTROL)
     await session.generate_reply(
         instructions=textwrap.dedent(f"""
