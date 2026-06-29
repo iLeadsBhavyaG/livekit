@@ -1,12 +1,16 @@
 import asyncio
+import inspect
 import logging
 import math
 import re
 import textwrap
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
+
 from dateutil import parser as dateutil_parser
 from dotenv import load_dotenv
+from livekit import api
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -14,17 +18,19 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     RunContext,
+    StopResponse,
     cli,
     function_tool,
+    get_job_context,
     inference,
     room_io,
+    stt,
 )
-from livekit.agents.llm import ChatContext
 from livekit.agents.inference import TurnDetector
+from livekit.agents.llm import ChatContext
 from livekit.plugins import ai_coustics, sarvam, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from openpyxl import load_workbook
-
 
 logger = logging.getLogger("agent")
 
@@ -48,31 +54,149 @@ def _is_missing(value) -> bool:
     return str(value).strip() == ""
 
 
+# Hindi words for 0-99. Indian numbers in this range are irregular (each has a
+# unique word), so they are listed explicitly. Used to SPEAK amounts and dates
+# fully in Hindi (Devanagari) — never half-English like "18 hazaar 750".
+_HINDI_NUMBERS_0_99 = {
+    0: "शून्य",
+    1: "एक",
+    2: "दो",
+    3: "तीन",
+    4: "चार",
+    5: "पाँच",
+    6: "छह",
+    7: "सात",
+    8: "आठ",
+    9: "नौ",
+    10: "दस",
+    11: "ग्यारह",
+    12: "बारह",
+    13: "तेरह",
+    14: "चौदह",
+    15: "पंद्रह",
+    16: "सोलह",
+    17: "सत्रह",
+    18: "अठारह",
+    19: "उन्नीस",
+    20: "बीस",
+    21: "इक्कीस",
+    22: "बाईस",
+    23: "तेईस",
+    24: "चौबीस",
+    25: "पच्चीस",
+    26: "छब्बीस",
+    27: "सत्ताईस",
+    28: "अट्ठाईस",
+    29: "उनतीस",
+    30: "तीस",
+    31: "इकतीस",
+    32: "बत्तीस",
+    33: "तैंतीस",
+    34: "चौंतीस",
+    35: "पैंतीस",
+    36: "छत्तीस",
+    37: "सैंतीस",
+    38: "अड़तीस",
+    39: "उनतालीस",
+    40: "चालीस",
+    41: "इकतालीस",
+    42: "बयालीस",
+    43: "तैंतालीस",
+    44: "चौवालीस",
+    45: "पैंतालीस",
+    46: "छियालीस",
+    47: "सैंतालीस",
+    48: "अड़तालीस",
+    49: "उनचास",
+    50: "पचास",
+    51: "इक्यावन",
+    52: "बावन",
+    53: "तिरपन",
+    54: "चौवन",
+    55: "पचपन",
+    56: "छप्पन",
+    57: "सत्तावन",
+    58: "अट्ठावन",
+    59: "उनसठ",
+    60: "साठ",
+    61: "इकसठ",
+    62: "बासठ",
+    63: "तिरसठ",
+    64: "चौंसठ",
+    65: "पैंसठ",
+    66: "छियासठ",
+    67: "सड़सठ",
+    68: "अड़सठ",
+    69: "उनहत्तर",
+    70: "सत्तर",
+    71: "इकहत्तर",
+    72: "बहत्तर",
+    73: "तिहत्तर",
+    74: "चौहत्तर",
+    75: "पचहत्तर",
+    76: "छिहत्तर",
+    77: "सतहत्तर",
+    78: "अठहत्तर",
+    79: "उन्यासी",
+    80: "अस्सी",
+    81: "इक्यासी",
+    82: "बयासी",
+    83: "तिरासी",
+    84: "चौरासी",
+    85: "पचासी",
+    86: "छियासी",
+    87: "सत्तासी",
+    88: "अट्ठासी",
+    89: "नवासी",
+    90: "नब्बे",
+    91: "इक्यानवे",
+    92: "बानवे",
+    93: "तिरानवे",
+    94: "चौरानवे",
+    95: "पंचानवे",
+    96: "छियानवे",
+    97: "सत्तानवे",
+    98: "अट्ठानवे",
+    99: "निन्यानवे",
+}
+
+
+def _number_to_hindi_words(amount: int) -> str:
+    """Spell an integer in Indian-system Hindi words (18750 -> 'अठारह हज़ार सात सौ पचास')."""
+    if amount < 0:
+        return "माइनस " + _number_to_hindi_words(-amount)
+    if amount == 0:
+        return _HINDI_NUMBERS_0_99[0]
+
+    crore, rem = divmod(amount, 10_000_000)
+    lakh, rem = divmod(rem, 100_000)
+    thousand, rem = divmod(rem, 1_000)
+    hundred, rem = divmod(rem, 100)  # rem is now 0-99
+
+    parts: list[str] = []
+    if crore:
+        # crore can exceed 99 for very large values; recurse so it still reads.
+        parts += [_number_to_hindi_words(crore), "करोड़"]
+    if lakh:
+        parts += [_HINDI_NUMBERS_0_99[lakh], "लाख"]
+    if thousand:
+        parts += [_HINDI_NUMBERS_0_99[thousand], "हज़ार"]
+    if hundred:
+        parts += [_HINDI_NUMBERS_0_99[hundred], "सौ"]
+    if rem:
+        parts.append(_HINDI_NUMBERS_0_99[rem])
+    return " ".join(parts)
+
+
 def _format_indian_amount(value) -> str:
-    """Format a rupee amount as spoken Indian words (18750 -> '18 hazaar 750 rupaye')."""
+    """Format a rupee amount fully in spoken Hindi (18750 -> 'अठारह हज़ार सात सौ पचास रुपये')."""
     if _is_missing(value):
         return "N/A"
     try:
         amount = int(float(value))
     except (TypeError, ValueError):
         return str(value).strip()
-
-    crore, rem = divmod(amount, 10_000_000)
-    lakh, rem = divmod(rem, 100_000)
-    hazaar, rem = divmod(rem, 1_000)
-
-    parts = []
-    if crore:
-        parts.append(f"{crore} crore")
-    if lakh:
-        parts.append(f"{lakh} lakh")
-    if hazaar:
-        parts.append(f"{hazaar} hazaar")
-    if rem:
-        parts.append(str(rem))
-    if not parts:
-        parts.append("0")
-    return " ".join(parts) + " rupaye"
+    return f"{_number_to_hindi_words(amount)} रुपये"
 
 
 def _format_date(value) -> str:
@@ -125,7 +249,9 @@ def _load_customer_context(path: Path) -> str:
 
     def cell(col_name: str):
         idx = columns.get(col_name)
-        return target_values[idx] if idx is not None and idx < len(target_values) else None
+        return (
+            target_values[idx] if idx is not None and idx < len(target_values) else None
+        )
 
     name_parts = [
         str(cell(col)).strip()
@@ -269,6 +395,77 @@ _HINDI_MONTHS = {
     "दिसंबर": "December",
     "दिसम्बर": "December",
 }
+
+# Canonical Hindi word for each day-of-month (1-31), used to SPEAK a date aloud
+# ("परसों" -> "एक जुलाई"). Reuses the 0-99 number words for a single source of truth.
+_HINDI_DAY_WORDS = {n: _HINDI_NUMBERS_0_99[n] for n in range(1, 32)}
+
+# English month name -> canonical Hindi month, derived from _HINDI_MONTHS.
+_ENGLISH_TO_HINDI_MONTH = {english: hindi for hindi, english in _HINDI_MONTHS.items()}
+
+# Hindi weekday names, indexed by datetime.weekday() (Monday == 0).
+_HINDI_WEEKDAYS = (
+    "सोमवार",
+    "मंगलवार",
+    "बुधवार",
+    "गुरुवार",
+    "शुक्रवार",
+    "शनिवार",
+    "रविवार",
+)
+
+
+def _spoken_hindi_date(dt: datetime) -> str:
+    """Render a date as naturally spoken Hindi words ('1 July' -> 'एक जुलाई')."""
+    day = _HINDI_DAY_WORDS.get(dt.day, str(dt.day))
+    month = _ENGLISH_TO_HINDI_MONTH.get(dt.strftime("%B"), dt.strftime("%B"))
+    return f"{day} {month}"
+
+
+def _relative_date_reference(today: datetime | None = None) -> str:
+    """Build a concrete relative-date table for the prompt.
+
+    Resolving "कल"/"next Monday" to a real date is date arithmetic, which LLMs
+    do unreliably. We compute the dates here so the model only has to look them
+    up: it speaks the Hindi form shown and passes the DD-MM-YYYY shown to the
+    tool, with no arithmetic of its own.
+    """
+    today = today or datetime.now()
+
+    def line(label: str, dt: datetime) -> str:
+        weekday = _HINDI_WEEKDAYS[dt.weekday()]
+        return f'- "{label}" = {_spoken_hindi_date(dt)} ({dt.strftime("%d-%m-%Y")}, {weekday})'
+
+    lines = [
+        line("आज / today", today),
+        line("कल / tomorrow", today + timedelta(days=1)),
+        line("परसों / day after tomorrow", today + timedelta(days=2)),
+    ]
+
+    # "N दिन बाद" / "in N days" for the next 30 days, so any "X days later" is a
+    # direct lookup — this is exactly where the model used to hallucinate dates.
+    lines.append("")
+    lines.append('Days from today ("N दिन बाद" / "in N days"):')
+    for n in range(1, 31):
+        dt = today + timedelta(days=n)
+        weekday = _HINDI_WEEKDAYS[dt.weekday()]
+        lines.append(
+            f'- "{_HINDI_NUMBERS_0_99[n]} दिन बाद / in {n} day(s)" = '
+            f"{_spoken_hindi_date(dt)} ({dt.strftime('%d-%m-%Y')}, {weekday})"
+        )
+
+    # Next occurrence of each weekday (strictly after today, within 1-7 days),
+    # so phrases like "अगले सोमवार" / "next Monday" resolve correctly.
+    lines.append("")
+    lines.append('Next weekday ("अगले <din>" / "next <weekday>"):')
+    for offset in range(1, 8):
+        dt = today + timedelta(days=offset)
+        weekday = _HINDI_WEEKDAYS[dt.weekday()]
+        lines.append(
+            f'- "अगले {weekday} / next {dt.strftime("%A")}" = '
+            f"{_spoken_hindi_date(dt)} ({dt.strftime('%d-%m-%Y')})"
+        )
+    return "\n".join(lines)
 
 
 def _hindi_words_to_number(text: str) -> int | None:
@@ -604,6 +801,58 @@ def save_call_outcome(
 
 
 # ---------------------------------------------------------------------------
+# Agent-initiated hangup
+#
+# Deleting the room ends the call for both web and SIP/telephony participants,
+# and fires the session "close" event that runs outcome classification. Kept as
+# a module-level function so the end_call tool stays trivially unit-testable
+# (tests monkeypatch _hangup instead of touching the LiveKit API).
+# ---------------------------------------------------------------------------
+# Closing/farewell markers used to detect when Priya has ended the call. These
+# are deliberately multi-word, closing-only phrases: a bare "धन्यवाद" also
+# appears in the OPENING greeting, so matching on that alone would cut the call
+# right after it starts. Romanized variants are included as a fallback.
+_FAREWELL_MARKERS = (
+    "आपका दिन शुभ",
+    "दिन शुभ हो",
+    "शुभ दिन",
+    "अलविदा",
+    "धन्यवाद आपका समय",
+    "aapka din shubh",
+    "din shubh ho",
+    "shubh din",
+    "alvida",
+)
+
+
+def _is_farewell(text) -> bool:
+    """True if the agent's line is a closing farewell (so the call can end)."""
+    if not text:
+        return False
+    # Strip punctuation (danda "।", commas, etc.) but keep the full Devanagari
+    # block U+0900-U+097F -- \w alone drops combining vowel marks (matras),
+    # which would mangle the Hindi words. Then collapse whitespace.
+    normalized = re.sub(r"[^\w\sऀ-ॿ]", " ", str(text))
+    normalized = re.sub(r"\s+", " ", normalized).strip().lower()
+    return any(marker in normalized for marker in _FAREWELL_MARKERS)
+
+
+async def _hangup() -> None:
+    """End the call by deleting the room."""
+    job_ctx = get_job_context()
+    if job_ctx is None:
+        logger.warning("Hangup requested but no job context is available")
+        return
+    try:
+        await job_ctx.api.room.delete_room(
+            api.DeleteRoomRequest(room=job_ctx.room.name)
+        )
+        logger.info(">>> HANGUP room=%r deleted", job_ctx.room.name)
+    except Exception:
+        logger.exception("Failed to delete room during hangup")
+
+
+# ---------------------------------------------------------------------------
 # Post-call outcome classification
 #
 # The outcome is NOT recorded by the voice agent via a tool. Asking the speaking
@@ -660,35 +909,94 @@ def _transcript_from_history(history: ChatContext) -> str:
         lines.append(f"{'Customer' if role == 'user' else 'Agent'}: {text}")
     return "\n".join(lines)
 
+
 def _is_valid_hindi_text(text: str) -> bool:
     """Check if transcribed text looks like Hindi/Hinglish, not garbage.
-    
+
     Garbage indicators: text in Spanish, French, random Latin scripts that
     aren't English + Hindi. Returns False if it looks like a bad STT output.
     """
     if not text or len(text.strip()) < 2:
         return True  # too short to judge, allow it
-    
+
     # Count scripts
-    devanagari_chars = sum(1 for c in text if '\u0900' <= c <= '\u097F')
+    devanagari_chars = sum(1 for c in text if "\u0900" <= c <= "\u097f")
     latin_chars = sum(1 for c in text if c.isascii() and c.isalpha())
     total_alpha = devanagari_chars + latin_chars
-    
+
     if total_alpha == 0:
         return True  # no letters, probably just punctuation/numbers
-    
+
     # Hindi/Hinglish should have at least 20% Devanagari OR be mostly English
     # If it's a mix with very little Devanagari, it's likely garbage (Spanish etc)
     devanagari_ratio = devanagari_chars / total_alpha
     latin_ratio = latin_chars / total_alpha
-    
+
     if total_alpha > 5 and devanagari_ratio < 0.15 and latin_ratio < 0.85:
         # Lots of text, almost no Devanagari, and not pure English either
-        logger.warning("Garbage STT detected: %r (%.1f%% Devanagari, %.1f%% Latin)", 
-                      text, devanagari_ratio * 100, latin_ratio * 100)
+        logger.warning(
+            "Garbage STT detected: %r (%.1f%% Devanagari, %.1f%% Latin)",
+            text,
+            devanagari_ratio * 100,
+            latin_ratio * 100,
+        )
         return False
-    
+
     return True
+
+
+# ---------------------------------------------------------------------------
+# STT noise filtering (filler sounds + duplicate finals)
+#
+# These are applied in Assistant.stt_node, which is the only reliable place to
+# drop an utterance BEFORE it becomes a user turn: there is no "user_speech"
+# session event, so an .on(...) handler can never block one. Dropping the
+# FINAL_TRANSCRIPT here means the utterance never reaches the transcript, the
+# LLM, or preemptive generation.
+# ---------------------------------------------------------------------------
+
+# Filler sounds with any elongation: "hmm", "uhh", "uhmm", "ahh", "err", ...
+_FILLER_TOKEN_RE = re.compile(
+    r"u+h+m*|u+m+|u+h*|h+m+|h+|m+|a+h+|e+r+|e+h+|o+h+|huh|hmm+"
+)
+# Devanagari spellings the STT may emit for the same sounds. Deliberately
+# excludes meaningful words like "हाँ" (yes) / "ना" (no).
+_DEVANAGARI_FILLERS = {
+    "हम्म",
+    "हम्म्म",
+    "हँ",
+    "अं",
+    "अँ",
+    "उम",
+    "उह",
+    "अह",
+    "आह",
+    "ऊँ",
+    "एं",
+}
+# Window within which an identical final transcript is treated as an STT
+# duplicate rather than the customer genuinely repeating themselves.
+_STT_DEDUP_WINDOW_S = 6.0
+
+
+def _is_filler_only(text: str) -> bool:
+    """True if the utterance is nothing but filler sounds ('hmm', 'उह')."""
+    if _is_missing(text):
+        return False
+    tokens = re.findall(r"[a-zऀ-ॿ]+", str(text).lower())
+    if not tokens:
+        return False
+    for tok in tokens:
+        if tok in _DEVANAGARI_FILLERS or _FILLER_TOKEN_RE.fullmatch(tok):
+            continue
+        return False
+    return True
+
+
+def _dedup_key(text: str) -> str:
+    """Normalize an utterance (lowercase, punctuation-stripped) for dedup compare."""
+    cleaned = re.sub(r"[^\w]+", " ", str(text).lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 async def classify_and_save_outcome(history: ChatContext, customer_name: str) -> None:
@@ -711,9 +1019,7 @@ async def classify_and_save_outcome(history: ChatContext, customer_name: str) ->
                 "text ONLY, nothing else.\n\n" + _OUTCOME_DEFINITIONS
             ),
         )
-        ctx.add_message(
-            role="user", content=f"Transcript:\n{transcript}\n\nOutcome:"
-        )
+        ctx.add_message(role="user", content=f"Transcript:\n{transcript}\n\nOutcome:")
 
         # A small, fast model — this is a trivial one-label classification, so we
         # avoid the heavy voice model. temperature=0 makes it deterministic and
@@ -754,6 +1060,10 @@ async def classify_and_save_outcome(history: ChatContext, customer_name: str) ->
 #   If identity cannot be verified, politely end the call.
 class Assistant(Agent):
     def __init__(self) -> None:
+        # Resolve relative dates ("कल", "next Monday") in code and hand the model
+        # a concrete lookup table, so it never has to do date arithmetic itself.
+        now = datetime.now()
+        relative_dates = _relative_date_reference(now)
         super().__init__(
             llm=inference.LLM(model="openai/gpt-4.1-mini"),
             instructions=textwrap.dedent(f"""
@@ -836,6 +1146,41 @@ Incorrect:
 Incorrect:
 "आपका ऋण खाता बकाया है।"
 
+================================================
+BFSI TERMINOLOGY (IMPORTANT)
+================================================
+
+Always use the standard English BFSI term, written in Latin script, for the
+words below. NEVER use their pure/literary Hindi translations. This applies
+everywhere, including your standard and confirmation lines.
+
+* "payment" — never भुगतान
+* "amount" — never राशि (do not use राशि at all; just say "payment")
+* "outstanding" / "due" / "overdue" — never बकाया
+* "loan" — never ऋण
+* "EMI" / "installment" — never किस्त / क़िस्त
+* "due date" — never देय तिथि / नियत तिथि
+* "confirm" — never पुष्टि
+* "verify" — never सत्यापन
+* "review" — never समीक्षा
+* "settlement" — never समझौता
+* "account" — never लेखा
+
+When asking how much the customer will pay, ask "कितनी payment कर पाएंगे?" —
+never insert राशि (do not say "कितनी राशि payment कर पाएंगे").
+
+Correct:
+"आप कितनी payment कर पाएंगे?"
+
+Incorrect:
+"आप कितनी राशि payment कर पाएंगे?"
+
+Correct:
+"आपका payment अभी outstanding है।"
+
+Incorrect:
+"आपकी राशि अभी बकाया है।"
+
 * Do not ask the customer which language they prefer.
 * Start every call in natural Hindi/Hinglish.
 * If language is unclear, continue in Hindi/Hinglish.
@@ -898,16 +1243,24 @@ Tool:
 amount="5000"
 date="25-06-2026"
 
-Today's date is {datetime.now().strftime("%d-%m-%Y")}.
+Today's date is {now.strftime("%d-%m-%Y")} ({_HINDI_WEEKDAYS[now.weekday()]}).
 
-Resolve relative dates such as:
+RELATIVE DATES — use this exact table. You are FORBIDDEN from calculating any
+date yourself; doing so has produced wrong dates. Every relative day the customer
+can say is already in the table below. Find the matching row, SPEAK the Hindi
+form shown, and pass the DD-MM-YYYY shown to the tool.
 
-* अगले सोमवार
-* next Monday
-* कल
-* अगले हफ्ते
+This explicitly includes "N दिन बाद" / "N days later" (for example "दस दिन बाद",
+"तीन दिन बाद"): look up the exact "N दिन बाद" row — NEVER add the days yourself.
 
-into absolute DD-MM-YYYY dates before calling tools.
+{relative_dates}
+
+When confirming a relative date with the customer, always state the date from the
+matching row (e.g. "दस दिन बाद से मतलब <table date>") — never a date you computed.
+For "अगले हफ्ते" / "next week", confirm a specific day from the table first. For a
+date not in the table (for example "महीने की 5 तारीख" / "5th of the month"), use
+the explicit day with the current or next month as the customer means, in
+DD-MM-YYYY.
 
 ================================================
 INDIAN DATE INTERPRETATION
@@ -928,13 +1281,13 @@ Interpret these naturally in conversation.
 
 Before recording a Promise To Pay, always confirm the exact payment date if there is any ambiguity.
 
-Example:
+Example (uses the table above — "कल" resolves to {_spoken_hindi_date(now + timedelta(days=1))}):
 
 Customer:
-"परसों कर दूँगा।"
+"कल कर दूँगा।"
 
 Agent:
-"जी, confirm कर दूँ — क्या आप 24 जून को payment करेंगे?"
+"जी, confirm कर दूँ — क्या आप {_spoken_hindi_date(now + timedelta(days=1))} को payment करेंगे?"
 
 Do not use pure Hindi words like पुष्टि, use words like confirm, verify instead.
 
@@ -1186,7 +1539,7 @@ WRONG PARTY
 
 Reveal no account information.
 
-End the call immediately.
+Apologize briefly and close with the farewell so the call ends.
 
 ================================================
 CALL CLOSING
@@ -1200,6 +1553,18 @@ Once a clear outcome has been reached:
 * End politely.
 
 Keep closing statements under two sentences.
+
+When the conversation is finished (an outcome has been reached, or it is a wrong
+party, or there is nothing more to do), end with a short farewell. Your final
+sentence MUST be a clear goodbye, ending with "धन्यवाद, आपका दिन शुभ हो।". The
+call ends automatically right after you say it, so say it only when you are truly
+done — do not say it mid-conversation.
+
+NEVER speak, type, read aloud, or output any function name, code, JSON, or tool
+syntax (for example never produce "end_call", "functions.end_call", or
+"{{ outcome_reached: ... }}"). Speak only natural Hindi to the customer. The call
+ending is handled automatically from your spoken farewell — you do not call any
+tool to end it.
 
 ================================================
 ESCALATION
@@ -1229,6 +1594,15 @@ Never use markdown in speech.
 
 Never use emojis.
 
+Never congratulate the customer or use celebratory words such as "बधाई",
+"मुबारक", or "congratulations". A payment is pending — there is nothing to
+celebrate. Open with a simple "नमस्ते" and get to the point directly, warmly,
+and politely.
+
+Never speak the ₹ symbol or any digits for money. Always state the Outstanding
+Amount exactly as written in CUSTOMER INFORMATION, in Hindi words (for example
+"नौ हज़ार पाँच सौ रुपये", never "₹9500" or "9500").
+
 Stay calm.
 
 Stay human.
@@ -1239,6 +1613,74 @@ Your goal is to achieve a clear resolution and collect the next best action.
 
 """),
         )
+        # Last committed user utterance, for the turn-level duplicate backstop
+        # in on_user_turn_completed (complements the stt_node final-dedup).
+        self._last_user_key = ""
+        self._last_user_at = 0.0
+
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        """Drop a user turn that exactly repeats the previous one.
+
+        A second safety net behind stt_node: if the STT still surfaces the same
+        utterance twice in quick succession, we discard the duplicate turn so it
+        never reaches the transcript or triggers a second response.
+        """
+        text = (new_message.text_content or "").strip()
+        key = _dedup_key(text)
+        now = time.monotonic()
+        if (
+            key
+            and key == self._last_user_key
+            and (now - self._last_user_at) < _STT_DEDUP_WINDOW_S
+        ):
+            logger.info(">>> DUPLICATE TURN dropped: %r", text)
+            raise StopResponse()
+        self._last_user_key, self._last_user_at = key, now
+
+    async def stt_node(self, audio, model_settings):
+        """Filter the STT stream before it becomes a user turn.
+
+        Drops three kinds of final transcripts so they never reach the
+        transcript, the LLM, or preemptive generation:
+          * garbage (non-Hindi/English STT misfires),
+          * filler-only utterances ("hmm", "उह"),
+          * back-to-back duplicate finals (the same line recognized twice).
+        Everything else (including interim transcripts) passes through
+        untouched, so VAD and turn detection are unaffected.
+        """
+        base = Agent.default.stt_node(self, audio, model_settings)
+        if inspect.isawaitable(base):
+            base = await base
+        if base is None:
+            return
+
+        last = {"key": "", "at": 0.0}
+        async for event in base:
+            if (
+                event.type == stt.SpeechEventType.FINAL_TRANSCRIPT
+                and event.alternatives
+            ):
+                text = event.alternatives[0].text or ""
+
+                if not _is_valid_hindi_text(text):
+                    logger.error(">>> GARBAGE STT dropped: %r", text)
+                    continue
+                if _is_filler_only(text):
+                    logger.info(">>> FILLER STT dropped: %r", text)
+                    continue
+
+                key = _dedup_key(text)
+                now = time.monotonic()
+                if (
+                    key
+                    and key == last["key"]
+                    and (now - last["at"]) < _STT_DEDUP_WINDOW_S
+                ):
+                    logger.info(">>> DUPLICATE STT dropped: %r", text)
+                    continue
+                last["key"], last["at"] = key, now
+
+            yield event
 
     @function_tool
     async def record_promise_to_pay(
@@ -1313,10 +1755,10 @@ server = AgentServer()
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load(
-        min_speech_duration=0.045,      # 100 
-        prefix_padding_duration=0.6,   # 200 ms speech pad
+        min_speech_duration=0.045,  # 100
+        prefix_padding_duration=0.6,  # 200 ms speech pad
         min_silence_duration=0.65,
-        activation_threshold=0.26,      # 200 ms silence pad
+        activation_threshold=0.26,  # 200 ms silence pad
     )
 
 
@@ -1329,7 +1771,12 @@ async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
 
     session = AgentSession(
-        stt=sarvam.STT(model="saaras:v3", language="hi-IN", mode="transcribe", high_vad_sensitivity=True),
+        stt=sarvam.STT(
+            model="saaras:v3",
+            language="hi-IN",
+            mode="transcribe",
+            high_vad_sensitivity=True,
+        ),
         tts=sarvam.TTS(
             target_language_code="hi-IN",
             model="bulbul:v3",
@@ -1341,14 +1788,54 @@ async def my_agent(ctx: JobContext):
         preemptive_generation=True,
     )
 
-    @session.on("user_speech")
-    def _intercept_garbage_stt(text: str):
-        """Reject garbage STT outputs (Spanish, etc) so the bot doesn't hang."""
-        if not _is_valid_hindi_text(text):
-            logger.error(">>> GARBAGE STT REJECTED: %r", text)
-            asyncio.create_task(session.say("Sorry, didn't catch that. Please repeat."))
-            return False  # block this utterance
-        return True  # valid, continue
+    # NOTE: garbage/filler/duplicate STT filtering now lives in
+    # Assistant.stt_node (see that method). The previous @session.on("user_speech")
+    # handler was a no-op — LiveKit has no "user_speech" event — so it never
+    # actually blocked anything; stt_node is the layer that does.
+
+    # End the call once Priya delivers her closing farewell. We detect the
+    # farewell in her transcript (deterministically) rather than via a tool call:
+    # asking the speaking model to emit a tool call on its closing turn makes the
+    # raw call syntax leak into the spoken transcript (and TTS reads it aloud).
+    # We wait for the farewell to finish playing before deleting the room.
+    farewell_state = {"pending": False, "done": False}
+
+    async def _do_hangup():
+        if farewell_state["done"]:
+            return
+        farewell_state["done"] = True
+        # Deleting the room ends both web and SIP sessions and triggers the
+        # "close" handler that classifies and saves the outcome.
+        await _hangup()
+
+    async def _end_after_farewell():
+        # Wait for the farewell utterance to finish playing, then drop the call.
+        speech = session.current_speech
+        if speech is not None:
+            try:
+                await speech.wait_for_playout()
+            except Exception:
+                logger.exception("wait_for_playout failed during farewell hangup")
+            await _do_hangup()
+        # If the speech handle isn't up yet, the agent_state_changed backstop
+        # below fires the hangup once Priya finishes speaking (returns to idle).
+
+    @session.on("conversation_item_added")
+    def _detect_farewell(ev):
+        item = ev.item
+        if getattr(item, "role", None) != "assistant" or farewell_state["pending"]:
+            return
+        if _is_farewell(item.text_content or ""):
+            logger.info(">>> FAREWELL detected; ending call after playout")
+            farewell_state["pending"] = True
+            asyncio.create_task(_end_after_farewell())
+
+    @session.on("agent_state_changed")
+    def _hangup_when_done_speaking(ev):
+        # Backstop: once the farewell has been flagged and Priya stops speaking,
+        # end the call. Guarded by _do_hangup so it never double-fires.
+        if farewell_state["pending"] and ev.new_state in ("listening", "idle"):
+            asyncio.create_task(_do_hangup())
 
     # Record the call outcome off the voice path, so no tool-call text can leak
     # to the customer. We kick it off on the session "close" event (fires ~2s
@@ -1399,6 +1886,9 @@ Ask, by name, if you are speaking to {LOADED_CUSTOMER_NAME}
 (for example: "नमस्ते, क्या मेरी बात {LOADED_CUSTOMER_NAME} जी से हो रही है?").
 
 Keep it short, natural, and conversational.
+
+Open with a simple "नमस्ते". Do NOT congratulate or use words like "बधाई" /
+"मुबारक" / "congratulations" — there is nothing to celebrate.
 
 Do NOT repeat introduction again after this.
 Do NOT ask multiple questions.
