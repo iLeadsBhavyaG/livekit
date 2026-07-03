@@ -32,7 +32,6 @@ from livekit.agents import (
 from livekit.agents.inference import TurnDetector
 from livekit.agents.llm import ChatContext
 from livekit.plugins import ai_coustics, openai, sarvam, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from openpyxl import load_workbook
 
 logger = logging.getLogger("agent")
@@ -1685,6 +1684,15 @@ async def my_agent(ctx: JobContext):
     # raw call syntax leak into the spoken transcript (and TTS reads it aloud).
     # We wait for the farewell to finish playing before deleting the room.
     farewell_state = {"pending": False, "done": False}
+    # Keep strong references to fire-and-forget tasks so they aren't garbage
+    # collected mid-flight (see RUF006).
+    farewell_tasks: set[asyncio.Task] = set()
+
+    def _spawn(coro):
+        task = asyncio.create_task(coro)
+        farewell_tasks.add(task)
+        task.add_done_callback(farewell_tasks.discard)
+        return task
 
     async def _do_hangup():
         if farewell_state["done"]:
@@ -1714,14 +1722,14 @@ async def my_agent(ctx: JobContext):
         if _is_farewell(item.text_content or ""):
             logger.info(">>> FAREWELL detected; ending call after playout")
             farewell_state["pending"] = True
-            asyncio.create_task(_end_after_farewell())
+            _spawn(_end_after_farewell())
 
     @session.on("agent_state_changed")
     def _hangup_when_done_speaking(ev):
         # Backstop: once the farewell has been flagged and Priya stops speaking,
         # end the call. Guarded by _do_hangup so it never double-fires.
         if farewell_state["pending"] and ev.new_state in ("listening", "idle"):
-            asyncio.create_task(_do_hangup())
+            _spawn(_do_hangup())
 
     # Record the call outcome off the voice path, so no tool-call text can leak
     # to the customer. We kick it off on the session "close" event (fires ~2s
