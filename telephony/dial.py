@@ -27,7 +27,7 @@ from openpyxl import load_workbook
 
 load_dotenv(".env.local")
 
-AGENT_NAME = "my-agent"
+AGENT_NAME = os.environ.get("AGENT_NAME", "my-agent")
 DATA_FILE = Path(__file__).parent.parent / "data" / "Customers.xlsx"
 
 

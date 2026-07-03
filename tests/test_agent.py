@@ -147,9 +147,11 @@ def test_relative_date_reference_lists_n_days_later() -> None:
         line for line in table.splitlines() if line.startswith('- "तीन दिन बाद')
     )
     assert "02-07-2026" in three
-    # The full 1..30 range is present.
+    # The near range (1..15 days) is present; the boundary day is included and
+    # anything beyond it is intentionally omitted to keep the prompt lean.
     assert '- "एक दिन बाद' in table
-    assert '- "तीस दिन बाद' in table
+    assert '- "पंद्रह दिन बाद' in table
+    assert '- "सोलह दिन बाद' not in table
 
 
 def test_relative_date_reference_lists_next_weekdays() -> None:
@@ -172,6 +174,44 @@ def test_format_indian_amount_full_hindi() -> None:
     assert agent_module._format_indian_amount(12345) == "बारह हज़ार तीन सौ पैंतालीस रुपये"
     # No ASCII digit ever leaks into the spoken form.
     assert not any(ch.isdigit() for ch in agent_module._format_indian_amount(987654))
+    # The Excel stores amounts as formatted strings — these must parse to Hindi
+    # words, not leak "₹9,500" (which would violate the no-digits speech rule).
+    assert agent_module._format_indian_amount(
+        "₹9,500"
+    ) == agent_module._format_indian_amount(9500)
+    assert agent_module._format_indian_amount(
+        "Rs. 1,00,000"
+    ) == agent_module._format_indian_amount(100000)
+    assert not any(ch.isdigit() for ch in agent_module._format_indian_amount("₹9,500"))
+
+
+def test_recommended_min_payment_is_half_to_nearest_thousand() -> None:
+    """The 'how much should I pay?' recommendation is half the outstanding,
+    computed in code (never by the LLM), rounded to the NEAREST thousand."""
+    # 9500 -> half 4750 -> nearest thousand 5000.
+    assert agent_module._recommended_min_payment(
+        9500
+    ) == agent_module._format_indian_amount(5000)
+    # 10000 -> half 5000 -> 5000.
+    assert agent_module._recommended_min_payment(
+        "10000"
+    ) == agent_module._format_indian_amount(5000)
+    # Formatted strings from the Excel (₹, commas) round the same way.
+    assert agent_module._recommended_min_payment(
+        "₹9,500"
+    ) == agent_module._format_indian_amount(5000)
+    # Rounds DOWN when the half is under x,500: 8800 -> half 4400 -> 4000.
+    assert agent_module._recommended_min_payment(
+        8800
+    ) == agent_module._format_indian_amount(4000)
+    # Exactly x,500 rounds UP: 9000 -> half 4500 -> 5000.
+    assert agent_module._recommended_min_payment(
+        9000
+    ) == agent_module._format_indian_amount(5000)
+    # Missing / unparseable → N/A (prompt falls back to "roughly half").
+    assert agent_module._recommended_min_payment(None) == "N/A"
+    assert agent_module._recommended_min_payment("") == "N/A"
+    assert agent_module._recommended_min_payment("not-a-number") == "N/A"
 
 
 def test_is_filler_only() -> None:
@@ -219,6 +259,92 @@ async def test_on_user_turn_completed_drops_immediate_duplicate(monkeypatch) -> 
     # The same words much later are a genuine repeat, not an STT glitch.
     clock["t"] = 1001.0 + agent_module._STT_DEDUP_WINDOW_S + 1
     await agent.on_user_turn_completed(None, msg("कर सकते हैं"))
+
+
+# --- Prompt structure guards (latency: prompt caching + lean prompt) ---------
+
+
+def test_prompt_places_customer_block_after_static_rules() -> None:
+    """Prompt caching: the large static rulebook must come FIRST so it stays a
+    stable prefix that Gemini can reuse across calls; the per-call customer data
+    (name, loan, dues) must sit at the END. If the customer block drifts back to
+    the top, every new call re-processes the whole prompt cold (cached=0)."""
+    ins = Assistant().instructions
+    bfsi = ins.index("BFSI TERMINOLOGY")  # part of the static rulebook
+    # This line is unique to the customer block.
+    customer = ins.index("Use this information naturally once the person confirms")
+    assert customer > bfsi, "customer block must come AFTER the static rulebook"
+    # And it must live in the final third of the prompt (dynamic content last).
+    assert customer > len(ins) * 0.6, "customer/dynamic content must be near the end"
+
+
+def test_prompt_retains_critical_directives() -> None:
+    """Trimming must not delete behavior the user fought for: BFSI term rules,
+    the no-राशि rule, tool arg format, the PTP tool, anti-repetition, and the
+    exact farewell string that _is_farewell keys on to end the call."""
+    ins = Assistant().instructions
+    for needle in (
+        "राशि",  # the "never use राशि" BFSI rule must remain
+        "never भुगतान",
+        "DD-MM-YYYY",
+        "record_promise_to_pay",
+        "ANTI-REPETITION",
+        "धन्यवाद, आपका दिन शुभ हो।",  # farewell trigger (see _is_farewell)
+        agent_module.LOADED_CUSTOMER_NAME,  # customer name still interpolated in
+    ):
+        assert needle and needle in ins, f"missing critical directive: {needle!r}"
+
+
+def test_prompt_stays_lean() -> None:
+    """Latency: a leaner prompt makes every cache-miss turn cheaper. A
+    redundancy-only trim took the baseline 15,147 chars down to ~14,180, but
+    behaviour features the user prioritised over latency (English-switch,
+    verification lockdown, amount-lock, friendlier tone, pay-recommendation) added
+    text back. Active leanness enforcement is PAUSED until the latency pass — this
+    ceiling is generous and only catches gross runaway (e.g. a duplicated block)."""
+    ins = Assistant().instructions
+    assert len(ins) < 16800, f"prompt is {len(ins)} chars; unexpected runaway growth"
+
+
+def test_prompt_forbids_verification_and_locks_amount() -> None:
+    """Behaviour the user explicitly asked for: never ask the customer to verify
+    identity (name confirmation is the only check), and once an amount is given
+    do not keep re-asking/re-confirming it."""
+    ins = Assistant().instructions
+    # No verification, anywhere in the call.
+    assert "ONLY check" in ins
+    assert "NEVER ask the customer to verify" in ins
+    # Amount is locked in once stated (no annoying re-confirmation).
+    assert "treat it as SET" in ins
+    assert "re-confirming" in ins
+
+
+def test_prompt_has_permanent_english_switch_rule() -> None:
+    """If the customer asks for English even once, the switch is permanent — the
+    agent must not drift back to Hindi/Hinglish or mix languages."""
+    ins = Assistant().instructions
+    assert "ENGLISH SWITCH" in ins
+    assert "PERMANENT" in ins
+    assert "NEVER switch back" in ins
+    assert "NEVER mix English with Hindi" in ins
+    # Must not start English on its own — only on explicit customer request.
+    assert "NEVER start speaking English on your own" in ins
+
+
+def test_first_speech_opens_with_namaste_intro_then_asks() -> None:
+    """The opening turn must: lead with नमस्ते, introduce Priya FIRST, THEN ask
+    the name — in Hindi only, with no verification questions."""
+    text = agent_module._first_speech_instructions("Rahul")
+    assert "नमस्ते" in text
+    assert "FIRST word" in text  # नमस्ते is mandated as the first word
+    assert "Rahul" in text  # customer name is interpolated in
+    # Intro ("...बोल रही हूँ") must come before the name-confirmation question.
+    assert text.index("बोल रही") < text.index("क्या मेरी बात"), (
+        "intro must precede the ask"
+    )
+    # No verification, and Hindi/Hinglish only (never English on the opening).
+    assert "Do NOT ask for any verification" in text
+    assert "never English" in text
 
 
 def _judge_llm() -> llm.LLM:
