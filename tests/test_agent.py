@@ -4,9 +4,32 @@ from datetime import datetime
 
 import pytest
 from livekit.agents import AgentSession, inference, llm
+from livekit.plugins import aws, openai
 
 import agent as agent_module
 from agent import Assistant
+
+
+def test_build_agent_llm_uses_bedrock_when_aws_configured(monkeypatch) -> None:
+    """With AWS creds present, the conversation LLM is Claude Haiku on Bedrock
+    in ap-south-1 (Mumbai) — the co-location latency path."""
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA_TEST")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret_test")
+    monkeypatch.delenv("BEDROCK_MODEL", raising=False)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+
+    built = agent_module._build_agent_llm()
+    assert isinstance(built, aws.LLM)
+
+
+def test_build_agent_llm_falls_back_to_openrouter_without_aws(monkeypatch) -> None:
+    """Without AWS creds, dev/tests keep working via the OpenRouter fallback."""
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.setenv("OPEN_ROUTER_KEY", "or_test")
+
+    built = agent_module._build_agent_llm()
+    assert isinstance(built, openai.LLM)
+    assert not isinstance(built, aws.LLM)
 
 
 @pytest.mark.asyncio
@@ -164,6 +187,20 @@ def test_relative_date_reference_lists_next_weekdays() -> None:
     assert "06-07-2026" in next_monday
 
 
+def test_relative_date_reference_lists_one_month() -> None:
+    """A month-scale timeframe ('एक महीने बाद' / 'अगले महीने') resolves to a
+    concrete ~30-day estimate, so the agent proposes a real date instead of
+    getting stumped."""
+    today = datetime(2026, 6, 29)
+    table = agent_module._relative_date_reference(today)
+    # 30 days after 29 June 2026 is 29 July 2026.
+    month_line = next(
+        line for line in table.splitlines() if line.startswith('- "एक महीने बाद')
+    )
+    assert "29-07-2026" in month_line
+    assert "उनतीस जुलाई" in month_line
+
+
 def test_format_indian_amount_full_hindi() -> None:
     """Amounts are spoken fully in Hindi words — never half-English like
     '18 hazaar 750'."""
@@ -299,11 +336,14 @@ def test_prompt_stays_lean() -> None:
     """Latency: a leaner prompt makes every cache-miss turn cheaper. A
     redundancy-only trim took the baseline 15,147 chars down to ~14,180, but
     behaviour features the user prioritised over latency (English-switch,
-    verification lockdown, amount-lock, friendlier tone, pay-recommendation) added
-    text back. Active leanness enforcement is PAUSED until the latency pass — this
-    ceiling is generous and only catches gross runaway (e.g. a duplicated block)."""
+    verification lockdown, amount-lock, friendlier tone, pay-recommendation,
+    exact-amount + exact-due-date disclosure, month-scale date handling,
+    no-re-greet + resume-after-interruption) added text back. The prompt is now
+    ~4k over the ~14.2k baseline, so a dedicated trim/latency pass is warranted.
+    Active leanness enforcement is PAUSED until then — this ceiling is generous
+    and only catches gross runaway (e.g. a duplicated block)."""
     ins = Assistant().instructions
-    assert len(ins) < 16800, f"prompt is {len(ins)} chars; unexpected runaway growth"
+    assert len(ins) < 18200, f"prompt is {len(ins)} chars; unexpected runaway growth"
 
 
 def test_prompt_forbids_verification_and_locks_amount() -> None:
@@ -317,6 +357,61 @@ def test_prompt_forbids_verification_and_locks_amount() -> None:
     # Amount is locked in once stated (no annoying re-confirmation).
     assert "treat it as SET" in ins
     assert "re-confirming" in ins
+
+
+def test_prompt_states_exact_outstanding_amount() -> None:
+    """The agent must state the EXACT Outstanding figure once identity is
+    confirmed — not a vague placeholder like 'कुछ राशि pending'. This guards the
+    fix for the model narrating 'some amount pending' instead of the real number.
+    """
+    ins = Assistant().instructions
+    # A behavioural mandate to speak the specific figure (not just a formatting
+    # note about words-vs-digits).
+    assert "EXACT Outstanding Amount" in ins
+    # Vague placeholders are explicitly forbidden.
+    assert "NEVER be vague about the figure" in ins
+    assert "कुछ outstanding" in ins  # listed as a forbidden phrasing
+
+
+def test_prompt_states_exact_due_date() -> None:
+    """The agent must state the EXACT EMI Due Date, not just say it is 'due'."""
+    ins = Assistant().instructions
+    assert "EXACT EMI Due Date" in ins
+
+
+def test_prompt_handles_month_scale_timeframe() -> None:
+    """'एक महीने बाद' must not stump the agent — it proposes the ~30-day
+    estimate as a concrete date and asks the customer to pay by then."""
+    ins = Assistant().instructions
+    assert "एक महीने बाद" in ins
+    assert "month-scale" in ins
+
+
+def test_prompt_forbids_regreeting_after_identity_confirmed() -> None:
+    """After the name is confirmed the agent must NEVER return to the opening
+    intro/greeting — a bug seen when it was interrupted mid-disclosure."""
+    ins = Assistant().instructions
+    assert "greeting and introduction are COMPLETE" in ins
+    assert "Returning to the intro after identity is confirmed" in ins
+
+
+def test_prompt_resumes_interrupted_disclosure() -> None:
+    """If cut off while stating the amount/due date, the agent resumes and
+    finishes that information instead of restarting from the greeting."""
+    ins = Assistant().instructions
+    assert "NEVER restart the call or return to the opening intro" in ins
+    assert "RESUME and finish delivering" in ins
+
+
+def test_prompt_enforces_brevity_and_no_repetition() -> None:
+    """The model was producing 25s+ replies that repeated the same question 2-3×.
+    The prompt must hard-cap replies to one or two sentences and forbid repeating
+    a question within a reply."""
+    ins = Assistant().instructions
+    assert "BREVITY" in ins
+    assert "ONE or TWO short spoken sentences" in ins
+    assert "exactly ONCE" in ins  # ask a question once, never repeat it
+    assert "Never produce more than two sentences" in ins
 
 
 def test_prompt_has_permanent_english_switch_rule() -> None:
