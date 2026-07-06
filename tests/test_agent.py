@@ -271,6 +271,95 @@ def test_dedup_key_normalizes() -> None:
     assert agent_module._dedup_key("हाँ, ठीक है।") == agent_module._dedup_key("हाँ ठीक है")
 
 
+def _history(*turns):
+    """Build a fake chat context: turns are (role, text) pairs."""
+    items = [types.SimpleNamespace(role=r, text_content=t) for r, t in turns]
+    return types.SimpleNamespace(items=items)
+
+
+def test_collapse_repeated_text_removes_self_duplicated_reply() -> None:
+    """The exact failure: the model emits its whole line twice in one generation
+    ('<line>\\n\\n<line>'). The output filter must keep only one copy."""
+    line = (
+        "धन्यवाद Pradeep जी। आपके HDFC Bank लोन में अभी नौ हज़ार पाँच सौ रुपये की "
+        "payment outstanding है, जो पिछली EMI की due date बीस जून थी। "
+        "क्या आप payment कब तक कर पाएंगे?"
+    )
+    collapsed = agent_module._collapse_repeated_text(line + "\n\n" + line)
+    assert collapsed.count("क्या आप payment कब तक कर पाएंगे") == 1
+    assert collapsed.count("धन्यवाद Pradeep जी") == 1
+
+    # A normal, non-repeating reply is returned unchanged.
+    assert agent_module._collapse_repeated_text(line) == line
+
+    # A case-only difference between the copies (EMi vs EMI) still collapses.
+    v2 = line.replace("EMI", "EMi")
+    assert agent_module._collapse_repeated_text(line + "\n\n" + v2).count("due date") == 1
+
+
+def test_strip_process_narration_drops_waiting_meta() -> None:
+    """The model narrating call mechanics ('no response, I'll wait') must be
+    stripped before TTS; a real customer-facing sentence is kept."""
+    meta = "क्योंकि ग्राहक से कुछ response नहीं मिला है, मैं प्रतीक्षा करूँगी।"
+    real = "क्या आप payment कब तक कर पाएंगे?"
+    stripped = agent_module._strip_process_narration(real + " " + meta)
+    assert "प्रतीक्षा" not in stripped
+    assert "response नहीं मिला" not in stripped
+    assert "क्या आप payment कब तक कर पाएंगे" in stripped
+    # A normal reply is untouched.
+    assert agent_module._strip_process_narration(real) == real
+
+
+def test_prompt_forbids_process_narration() -> None:
+    """The prompt must forbid narrating call mechanics / waiting."""
+    ins = Assistant().instructions
+    assert "Never narrate the call mechanics" in ins
+
+
+def test_is_echo_of_flags_agent_bleed_not_genuine_replies() -> None:
+    """The agent's own line echoed back as 'user' speech is flagged; short or
+    distinct genuine replies are not."""
+    q = "आप payment कब तक कर पाएंगे"
+    # Full echo of the agent's question (audio bleed) → echo.
+    assert agent_module._is_echo_of("आप payment कब तक कर पाएंगे", q)
+    assert agent_module._is_echo_of("कृपया बताएं आप payment कब तक कर पाएंगे", q)
+    # Genuine short answers → NOT echo (must reach the agent).
+    assert not agent_module._is_echo_of("हाँ", q)
+    assert not agent_module._is_echo_of("पंद्रह June को", q)
+    assert not agent_module._is_echo_of("अगले हफ्ते कर दूँगा", q)
+
+
+@pytest.mark.asyncio
+async def test_on_user_turn_completed_drops_empty_and_echo(monkeypatch) -> None:
+    """Empty/filler turns and echoes of the agent's own last line are dropped so
+    the agent never re-asks in response to non-input."""
+    from livekit.agents import StopResponse
+
+    monkeypatch.setattr(agent_module.time, "monotonic", lambda: 1000.0)
+    agent = Assistant()
+
+    def msg(text):
+        return types.SimpleNamespace(text_content=text)
+
+    # Empty and filler turns get no response.
+    with pytest.raises(StopResponse):
+        await agent.on_user_turn_completed(None, msg(""))
+    with pytest.raises(StopResponse):
+        await agent.on_user_turn_completed(None, msg("hmm"))
+
+    # A turn echoing the agent's own last line (TTS bleed) is dropped.
+    turn_ctx = _history(
+        ("assistant", "आप payment कब तक कर पाएंगे?"),
+    )
+    with pytest.raises(StopResponse):
+        await agent.on_user_turn_completed(
+            turn_ctx, msg("आप payment कब तक कर पाएंगे")
+        )
+
+    # A genuine answer to that same question is NOT dropped.
+    await agent.on_user_turn_completed(turn_ctx, msg("अगले हफ्ते कर दूँगा"))
+
+
 @pytest.mark.asyncio
 async def test_on_user_turn_completed_drops_immediate_duplicate(monkeypatch) -> None:
     """A user turn that exactly repeats the previous one (within the dedup
@@ -338,12 +427,13 @@ def test_prompt_stays_lean() -> None:
     behaviour features the user prioritised over latency (English-switch,
     verification lockdown, amount-lock, friendlier tone, pay-recommendation,
     exact-amount + exact-due-date disclosure, month-scale date handling,
-    no-re-greet + resume-after-interruption) added text back. The prompt is now
-    ~4k over the ~14.2k baseline, so a dedicated trim/latency pass is warranted.
-    Active leanness enforcement is PAUSED until then — this ceiling is generous
-    and only catches gross runaway (e.g. a duplicated block)."""
+    no-re-greet + resume-after-interruption, when-first collection + partial-pay
+    rules, single-ask + anti-loop payment-timing) added text back. The prompt is
+    now ~5.2k over the ~14.2k baseline — a dedicated trim/latency pass is now
+    OVERDUE. Active leanness enforcement is PAUSED until then — this ceiling is
+    generous and only catches gross runaway (e.g. a duplicated block)."""
     ins = Assistant().instructions
-    assert len(ins) < 18200, f"prompt is {len(ins)} chars; unexpected runaway growth"
+    assert len(ins) < 20000, f"prompt is {len(ins)} chars; unexpected runaway growth"
 
 
 def test_prompt_forbids_verification_and_locks_amount() -> None:
@@ -403,8 +493,36 @@ def test_prompt_resumes_interrupted_disclosure() -> None:
     assert "RESUME and finish delivering" in ins
 
 
+def test_prompt_asks_when_can_pay_first() -> None:
+    """Right after disclosing the dues, the first question must be WHEN the
+    customer can pay — asked only ONCE (not twice), and never 'how much'."""
+    ins = Assistant().instructions
+    assert "ask WHEN they can pay" in ins
+    # The when-question must be asked once, not doubled in the same line.
+    assert "asked exactly once and never repeated or reworded" in ins
+
+
+def test_prompt_never_reasks_payment_timing() -> None:
+    """The open 'कब तक' timing question is asked once; a re-ask is forbidden and
+    replaced with a closed date confirmation, so the agent can't loop on it."""
+    ins = Assistant().instructions
+    assert "never ask that timing question again" in ins
+    # The single verbatim 'कब तक payment कर पाएंगे' example must not be duplicated
+    # across sections (verbatim repetition primes the model to echo/loop it).
+    assert ins.count("कब तक payment कर पाएंगे") <= 1
+
+
+def test_prompt_chases_missing_piece_and_limits_partial_followup() -> None:
+    """If only one of {date, amount} is given, chase the missing piece; and for a
+    partial payment never push for the remaining balance unless it is < ₹1000."""
+    ins = Assistant().instructions
+    assert "ask for the missing piece" in ins
+    assert "do NOT ask when they will pay the remaining balance" in ins
+    assert "below one thousand rupees" in ins
+
+
 def test_prompt_enforces_brevity_and_no_repetition() -> None:
-    """The model was producing 25s+ replies that repeated the same question 2-3×.
+    """The model was producing 25s+ replies that repeated the same question 2-3 times.
     The prompt must hard-cap replies to one or two sentences and forbid repeating
     a question within a reply."""
     ins = Assistant().instructions
