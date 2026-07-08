@@ -28,6 +28,7 @@ dependencies = [
     { name = "livekit-agents", extra = ["silero", "turn-detector"] },
     { name = "livekit-plugins-ai-coustics" },
     { name = "livekit-plugins-aws" },
+    { name = "livekit-plugins-cartesia" },
     { name = "livekit-plugins-sarvam" },
     { name = "openpyxl" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -48,6 +49,7 @@ requires-dist = [
     { name = "livekit-agents", extras = ["silero", "turn-detector"], specifier = ">=1.6.1" },
     { name = "livekit-plugins-ai-coustics", specifier = "~=0.2" },
     { name = "livekit-plugins-aws", specifier = ">=1.6.0" },
+    { name = "livekit-plugins-cartesia", specifier = ">=1.6.3" },
     { name = "livekit-plugins-sarvam", specifier = ">=1.6.0" },
     { name = "openpyxl", specifier = ">=3.1" },
     { name = "pandas", specifier = ">=2.0" },
@@ -1510,6 +1512,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/48/82/ae884a423a3bf9acc8e759aa6f237630824433958118f08d3e2284c2002e/livekit_plugins_aws-1.6.3.tar.gz", hash = "sha256:8b3d08485e5ba364c82f1e8e6277d85d97d298075b9f4b7459c257764374835f", size = 46631, upload-time = "2026-06-22T22:24:38.448Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f1/8e/57c7f401d6bac09e8c04e8034675be1d210f17d4c59dc88211aa48b87207/livekit_plugins_aws-1.6.3-py3-none-any.whl", hash = "sha256:9e35676fcb9a1a323f09a03f0c1074dc3fe93db9a4e42b8252df9305bc522eaf", size = 52251, upload-time = "2026-06-22T22:24:37.362Z" },
+]
+
+[[package]]
+name = "livekit-plugins-cartesia"
+version = "1.6.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "livekit-agents" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/87/5d/a7483ada58505b8f98954c33c050a416db33e220d4149590210a22be5e36/livekit_plugins_cartesia-1.6.3.tar.gz", hash = "sha256:5b7f370cf3ddc9026844ed8471cf1488353cf05e2857ed83fc5ce9fc97d8780f", size = 18192, upload-time = "2026-06-22T22:24:56.247Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f3/8e/76574e98f8271a5c88c47eb7ed9a08407030d184a785aa4384cc0ace0f85/livekit_plugins_cartesia-1.6.3-py3-none-any.whl", hash = "sha256:5131e08e3fb835e2e71c0ea5fadb51b611d4fa181e7bd1e39c3e2eca21f639cf", size = 25532, upload-time = "2026-06-22T22:24:54.819Z" },
 ]
 
 [[package]]

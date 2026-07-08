@@ -31,7 +31,7 @@ from livekit.agents import (
 )
 from livekit.agents.inference import TurnDetector
 from livekit.agents.llm import ChatContext
-from livekit.plugins import ai_coustics, aws, openai, sarvam, silero
+from livekit.plugins import ai_coustics, aws, cartesia, openai, sarvam, silero
 from openpyxl import load_workbook
 
 from prompt_og import build_agent_instructions
@@ -1218,29 +1218,46 @@ async def classify_and_save_outcome(history: ChatContext, customer_name: str) ->
 def _build_agent_llm():
     """Build the conversation LLM.
 
-    If AWS credentials are present, use Claude Haiku on Amazon Bedrock in
-    ap-south-1 (Mumbai) — co-located compute for low latency to Indian callers.
-    This is the co-location latency test. Otherwise fall back to OpenRouter
-    gpt-4.1-mini (latency-sorted routing) so dev/tests work without AWS. Toggle
-    by setting or unsetting AWS_ACCESS_KEY_ID in .env.local.
+    Currently testing gpt-4.1-mini via OpenRouter Nitro (the else branch) — it
+    supports real tool-calling (Voxtral wouldn't call tools; Llama 3 8B rejected
+    the tool schema) and follows the Hindi language rules, with faster TTFT than
+    the 24B Mistral it replaced, at the cost of the Mumbai co-location (OpenRouter
+    routes to US/EU, not in-region).
 
-    BEDROCK_MODEL must be an inference-profile id available in the target
-    region. For ap-south-1 (Mumbai) the latest Claude is served only via the
-    Global cross-region inference profile (the "global." prefix), not the bare
-    model id — see AWS's "Claude models in India" guidance.
+    The Bedrock branch is kept but dormant: if BEDROCK_AWS_* creds are present it
+    uses Mistral Voxtral Mini 3B on Amazon Bedrock in ap-south-1 (Mumbai) — a
+    bare, in-region model id, serverless (not Marketplace-gated, so it bypasses
+    the INVALID_PAYMENT_INSTRUMENT wall) and ~400ms co-located with Sarvam. That
+    path is off for now because Voxtral won't call tools / obey the Hindi rule.
+
+    Creds are namespaced BEDROCK_AWS_* in .env.local on purpose: the deployable
+    agent.py gates on the bare AWS_ACCESS_KEY_ID, so namespacing keeps agent.py
+    (and its tests) on OpenRouter while this sandbox opts in. We promote the
+    BEDROCK_AWS_* pair to the standard AWS_* names here so boto3 (inside aws.LLM)
+    can authenticate.
     """
+    if os.environ.get("BEDROCK_AWS_ACCESS_KEY_ID"):
+        os.environ.setdefault(
+            "AWS_ACCESS_KEY_ID", os.environ["BEDROCK_AWS_ACCESS_KEY_ID"]
+        )
+        os.environ.setdefault(
+            "AWS_SECRET_ACCESS_KEY", os.environ["BEDROCK_AWS_SECRET_ACCESS_KEY"]
+        )
     if os.environ.get("AWS_ACCESS_KEY_ID"):
         return aws.LLM(
-            model=os.environ.get(
-                "BEDROCK_MODEL", "global.anthropic.claude-haiku-4-5-20251001-v1:0"
-            ),
+            model=os.environ.get("BEDROCK_MODEL", "mistral.voxtral-mini-3b-2507"),
             region=os.environ.get("AWS_REGION", "ap-south-1"),
             temperature=0,
         )
+    # gpt-4.1-mini via OpenRouter Nitro: the ":nitro" suffix routes to the
+    # highest-throughput provider for the model (equivalent to
+    # provider={"sort": "throughput"}), trading raw provider price for faster
+    # generation — the priority for a latency-sensitive voice agent. gpt-4.1-mini
+    # also has faster TTFT than the 24B Mistral while still handling the
+    # Hindi/Hinglish prompt and tool-calling.
     return openai.LLM.with_openrouter(
-        model="openai/gpt-4.1-mini",
+        model="openai/gpt-4.1-mini:nitro",
         api_key=os.environ.get("OPEN_ROUTER_KEY"),
-        provider={"sort": "latency"},
     )
 
 
@@ -1320,7 +1337,9 @@ class Assistant(Agent):
         async for chunk in base:
             delta = getattr(chunk, "delta", None)
             content = getattr(delta, "content", None) if delta is not None else None
-            tool_calls = getattr(delta, "tool_calls", None) if delta is not None else None
+            tool_calls = (
+                getattr(delta, "tool_calls", None) if delta is not None else None
+            )
             if tool_calls or not content:
                 yield chunk
                 continue
@@ -1537,16 +1556,16 @@ async def my_agent(ctx: JobContext):
             mode="transcribe",
             high_vad_sensitivity=True,
         ),
-        tts=sarvam.TTS(
-            target_language_code="hi-IN",
-            model="bulbul:v3",
-            speaker="ishita",
-            pace=1.1,
-            # Latency: emit the first audio chunk sooner (default 50, min allowed
-            # 30) to cut TTS ttfb, and cache repeated lines (greeting,
-            # confirmations) so they come back near-instantly.
-            min_buffer_size=30,
-            enable_cached_responses=True,
+        # Trying Cartesia TTS to reduce ttfb (just for this experiment — agent.py
+        # stays on Sarvam). sonic-turbo is Cartesia's lowest-latency model and
+        # still supports Hindi (sonic-2/sonic are sunsetted for hi -> HTTP 400
+        # "Model sunsetted", which surfaced as "no audio frames were pushed").
+        # api key is read from CARTESIA_API_KEY, voice from CARTESIA_VOICE_ID.
+        tts=cartesia.TTS(
+            model="sonic-turbo",
+            language="hi",
+            volume=1.2,
+            voice=os.environ["CARTESIA_VOICE_ID"],
         ),
         turn_detection=TurnDetector(version="v1-mini"),
         vad=ctx.proc.userdata["vad"],
