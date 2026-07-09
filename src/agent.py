@@ -285,7 +285,7 @@ def _load_customer_context(path: Path) -> str:
                 }
             continue
         data_rows_seen += 1
-        if data_rows_seen == 2:  # matches the previous df.iloc[1]
+        if data_rows_seen == 4:  # matches the previous df.iloc[1]
             target_values = sheet_row
             break
 
@@ -1133,27 +1133,58 @@ _PROCESS_NARRATION = re.compile(
     r"(?:response|जवाब)\s*नहीं\s*मिल"
     r"|कोई\s*(?:response|जवाब)\s*नहीं"
     r"|मैं\s*प्रतीक्षा"
-    r"|मैं\s*(?:wait|इंतज़ार|इंतजार)",
+    r"|मैं\s*(?:wait|इंतज़ार|इंतजार)"
+    # English call-mechanics narration gpt-oss-120b sometimes appends to an
+    # otherwise-good reply (live call outbound-1783578453 spoke aloud
+    # "...payment कर पाएंगे?We wait.(Waiting for user response)").
+    r"|\bwe\s*wait\b"
+    r"|\bwaiting\b"
+    r"|\bno\s+response\s+(?:received|yet)\b"
+    r"|\b(?:i'?ll|we'?ll|i\s+will|let\s+me)\s+wait\b"
+    r"|\bwe\s+need\s+to\b"
+    r"|\buser\s+confirms?\b"
+    r"|record_promise_to_pay\s*\("
+    r"|functions\.",
     re.IGNORECASE,
 )
 
+# Parenthetical / bracketed stage directions the model sometimes emits
+# ("(Waiting for user response)", "(pause)", "[thinking]"). These are never
+# spoken on a live call (the prompt forbids them), so strip the whole span.
+_STAGE_DIRECTION = re.compile(r"\s*[\(\[][^)\]]*[\)\]]")
+
 
 def _strip_process_narration(text: str) -> str:
-    """Remove sentences where the model narrates the call mechanics / that it is
-    waiting, rather than actually talking to the customer."""
-    out: list[str] = []
-    end = 0
-    for m in _SENTENCE_SPLIT.finditer(text):
-        end = m.end()
-        sentence = m.group(0)
-        if _PROCESS_NARRATION.search(sentence):
-            logger.warning(">>> META-NARRATION dropped: %r", sentence.strip())
-            continue
-        out.append(sentence)
-    tail = text[end:]
-    if tail and not _PROCESS_NARRATION.search(tail):
-        out.append(tail)
-    return "".join(out)
+    """Truncate a runaway reply at the first call-mechanics marker.
+
+    gpt-oss-120b sometimes (nondeterministically, more in high-load windows)
+    scripts the rest of the call into one reply: the real answer, then
+    meta-narration ("We wait"/"Waiting..."), re-asked questions, and even a
+    spurious farewell that would hang up the call. The real answer is always the
+    clean prefix, so cut everything from the first marker onward — this removes
+    the meta, the repeats, tool-call-as-text, and the premature-hangup farewell
+    in one move.
+    """
+    m = _PROCESS_NARRATION.search(text)
+    if not m:
+        return text
+    logger.warning(
+        ">>> RUNAWAY truncated at %d: %r", m.start(), text[m.start() : m.start() + 60]
+    )
+    return text[: m.start()]
+
+
+def _strip_stage_directions(text: str) -> str:
+    """Strip parenthetical/bracketed stage directions before they reach TTS.
+
+    gpt-oss-120b sometimes tacks a stage direction onto a good reply
+    ("...(Waiting for user response)"), which TTS would otherwise read aloud.
+    """
+    stripped = _STAGE_DIRECTION.sub(" ", text)
+    if stripped != text:
+        logger.warning(">>> STAGE-DIRECTION stripped from %r", text.strip())
+    # Collapse any doubled spaces the removal introduced.
+    return re.sub(r"[ \t]{2,}", " ", stripped)
 
 
 async def classify_and_save_outcome(history: ChatContext, customer_name: str) -> None:
@@ -1320,7 +1351,9 @@ class Assistant(Agent):
         async for chunk in base:
             delta = getattr(chunk, "delta", None)
             content = getattr(delta, "content", None) if delta is not None else None
-            tool_calls = getattr(delta, "tool_calls", None) if delta is not None else None
+            tool_calls = (
+                getattr(delta, "tool_calls", None) if delta is not None else None
+            )
             if tool_calls or not content:
                 yield chunk
                 continue
@@ -1329,7 +1362,9 @@ class Assistant(Agent):
 
         if carrier is not None:
             full = "".join(parts)
-            cleaned = _collapse_repeated_text(_strip_process_narration(full))
+            cleaned = _collapse_repeated_text(
+                _strip_process_narration(_strip_stage_directions(full))
+            )
             if cleaned != full:
                 logger.warning(
                     ">>> LLM output cleaned (%d -> %d chars)", len(full), len(cleaned)

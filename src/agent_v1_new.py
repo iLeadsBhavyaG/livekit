@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import json
 import logging
 import math
 import os
@@ -30,7 +31,7 @@ from livekit.agents import (
     stt,
 )
 from livekit.agents.inference import TurnDetector
-from livekit.agents.llm import ChatContext
+from livekit.agents.llm import ChatChunk, ChatContext, ChoiceDelta
 from livekit.plugins import ai_coustics, aws, cartesia, openai, sarvam, silero
 from openpyxl import load_workbook
 
@@ -1133,27 +1134,101 @@ _PROCESS_NARRATION = re.compile(
     r"(?:response|जवाब)\s*नहीं\s*मिल"
     r"|कोई\s*(?:response|जवाब)\s*नहीं"
     r"|मैं\s*प्रतीक्षा"
-    r"|मैं\s*(?:wait|इंतज़ार|इंतजार)",
+    r"|मैं\s*(?:wait|इंतज़ार|इंतजार)"
+    # English call-mechanics narration gpt-oss-120b sometimes appends to an
+    # otherwise-good reply (live call outbound-1783578453 spoke aloud
+    # "...payment कर पाएंगे?We wait.(Waiting for user response)").
+    r"|\bwe\s*wait\b"
+    r"|\bwaiting\b"
+    r"|\bno\s+response\s+(?:received|yet)\b"
+    r"|\b(?:i'?ll|we'?ll|i\s+will|let\s+me)\s+wait\b"
+    r"|\bwe\s+need\s+to\b"
+    r"|\buser\s+confirms?\b"
+    r"|record_promise_to_pay\s*\("
+    r"|functions\.",
     re.IGNORECASE,
 )
 
+# Parenthetical / bracketed stage directions the model sometimes emits
+# ("(Waiting for user response)", "(pause)", "[thinking]"). These are never
+# spoken on a live call (the prompt forbids them), so strip the whole span.
+_STAGE_DIRECTION = re.compile(r"\s*[\(\[][^)\]]*[\)\]]")
+
 
 def _strip_process_narration(text: str) -> str:
-    """Remove sentences where the model narrates the call mechanics / that it is
-    waiting, rather than actually talking to the customer."""
-    out: list[str] = []
-    end = 0
-    for m in _SENTENCE_SPLIT.finditer(text):
-        end = m.end()
-        sentence = m.group(0)
-        if _PROCESS_NARRATION.search(sentence):
-            logger.warning(">>> META-NARRATION dropped: %r", sentence.strip())
-            continue
-        out.append(sentence)
-    tail = text[end:]
-    if tail and not _PROCESS_NARRATION.search(tail):
-        out.append(tail)
-    return "".join(out)
+    """Truncate a runaway reply at the first call-mechanics marker.
+
+    gpt-oss-120b sometimes (nondeterministically, more in high-load windows)
+    scripts the rest of the call into one reply: the real answer, then
+    meta-narration ("We wait"/"Waiting..."), re-asked questions, and even a
+    spurious farewell that would hang up the call. The real answer is always the
+    clean prefix, so cut everything from the first marker onward — this removes
+    the meta, the repeats, tool-call-as-text, and the premature-hangup farewell
+    in one move.
+    """
+    m = _PROCESS_NARRATION.search(text)
+    if not m:
+        return text
+    logger.warning(
+        ">>> RUNAWAY truncated at %d: %r", m.start(), text[m.start() : m.start() + 60]
+    )
+    return text[: m.start()]
+
+
+def _strip_stage_directions(text: str) -> str:
+    """Strip parenthetical/bracketed stage directions before they reach TTS.
+
+    gpt-oss-120b sometimes tacks a stage direction onto a good reply
+    ("...(Waiting for user response)"), which TTS would otherwise read aloud.
+    """
+    stripped = _STAGE_DIRECTION.sub(" ", text)
+    if stripped != text:
+        logger.warning(">>> STAGE-DIRECTION stripped from %r", text.strip())
+    # Collapse any doubled spaces the removal introduced.
+    return re.sub(r"[ \t]{2,}", " ", stripped)
+
+
+# Local capture of runaway/leak turns for offline root-cause analysis. When the
+# output cleaner has to change something (a real leak), we append the EXACT LLM
+# input (full message history) and the raw un-cleaned output to this file so the
+# turn can be replayed deterministically. Best-effort; never breaks the call.
+_LEAK_LOG = Path(__file__).resolve().parent.parent / "llm_leaks.jsonl"
+
+
+def _serialize_chat_ctx(chat_ctx) -> list[dict]:
+    """Flatten a ChatContext into plain dicts (role, type, text, tool details)."""
+    out: list[dict] = []
+    for it in getattr(chat_ctx, "items", []) or []:
+        entry: dict = {
+            "type": getattr(it, "type", None),
+            "role": getattr(it, "role", None),
+        }
+        try:
+            entry["text"] = it.text_content
+        except Exception:
+            entry["text"] = getattr(it, "content", None)
+        for attr in ("name", "arguments", "call_id", "output"):
+            v = getattr(it, attr, None)
+            if v is not None:
+                entry[attr] = v if isinstance(v, str) else repr(v)
+        out.append(entry)
+    return out
+
+
+def _dump_leak(chat_ctx, raw: str, cleaned: str) -> None:
+    """Append one leak capture (exact input + raw output) to _LEAK_LOG."""
+    try:
+        rec = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "raw": raw,
+            "cleaned": cleaned,
+            "messages": _serialize_chat_ctx(chat_ctx),
+        }
+        with _LEAK_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        logger.warning(">>> LEAK CAPTURED to %s (raw=%d chars)", _LEAK_LOG, len(raw))
+    except Exception:
+        logger.exception(">>> failed to write leak capture")
 
 
 async def classify_and_save_outcome(history: ChatContext, customer_name: str) -> None:
@@ -1218,11 +1293,13 @@ async def classify_and_save_outcome(history: ChatContext, customer_name: str) ->
 def _build_agent_llm():
     """Build the conversation LLM.
 
-    Currently testing gpt-4.1-mini via OpenRouter Nitro (the else branch) — it
-    supports real tool-calling (Voxtral wouldn't call tools; Llama 3 8B rejected
-    the tool schema) and follows the Hindi language rules, with faster TTFT than
-    the 24B Mistral it replaced, at the cost of the Mumbai co-location (OpenRouter
-    routes to US/EU, not in-region).
+    Currently testing gpt-oss-120b on Cerebras (the else branch) — it supports
+    real tool-calling (Voxtral wouldn't call tools; Llama 3 8B rejected the tool
+    schema) and follows the Hindi language rules, with low TTFT from Cerebras'
+    wafer-scale inference, at the cost of the Mumbai co-location (Cerebras routes
+    to US, not in-region). It replaced gemma-4-31b (bigger 117B/5.1B-active MoE,
+    ~3x cheaper). A Groq trial of the same model was reverted: Groq's free tier
+    caps at 8,000 TPM, far too low for our ~4,700-token prompt (see below).
 
     The Bedrock branch is kept but dormant: if BEDROCK_AWS_* creds are present it
     uses Mistral Voxtral Mini 3B on Amazon Bedrock in ap-south-1 (Mumbai) — a
@@ -1249,15 +1326,23 @@ def _build_agent_llm():
             region=os.environ.get("AWS_REGION", "ap-south-1"),
             temperature=0,
         )
-    # gpt-4.1-mini via OpenRouter Nitro: the ":nitro" suffix routes to the
-    # highest-throughput provider for the model (equivalent to
-    # provider={"sort": "throughput"}), trading raw provider price for faster
-    # generation — the priority for a latency-sensitive voice agent. gpt-4.1-mini
-    # also has faster TTFT than the 24B Mistral while still handling the
-    # Hindi/Hinglish prompt and tool-calling.
-    return openai.LLM.with_openrouter(
-        model="openai/gpt-4.1-mini:nitro",
-        api_key=os.environ.get("OPEN_ROUTER_KEY"),
+    # gpt-oss-120b on Cerebras. reasoning_effort="low" keeps thinking minimal for
+    # voice; reasoning stays in a separate `reasoning` field (not `content`) so it
+    # is never spoken. api_key defaults to CEREBRAS_API_KEY.
+    #
+    # We briefly switched to Groq (~2x cheaper on paper), but its FREE tier caps
+    # at 8,000 TPM — our ~4,700-token prompt hits that in <2 turns/min, so it 429s
+    # constantly. Cerebras' free tier is ~60-100k TPM (8-12x more headroom) and it
+    # actually caches our prefix (Groq reported cached=0 through LiveKit). Groq is
+    # only worth revisiting on its paid Dev tier. To try Groq again:
+    #   openai.LLM(model="openai/gpt-oss-120b", api_key=os.environ["GROQ_API_KEY"],
+    #       base_url="https://api.groq.com/openai/v1",
+    #       reasoning_effort="low", temperature=0)
+    return openai.LLM.with_cerebras(
+        model="gpt-oss-120b",
+        api_key=os.environ.get("CEREBRAS_API_KEY"),
+        reasoning_effort="low",
+        temperature=0,
     )
 
 
@@ -1269,24 +1354,52 @@ def _content_tokens(text: str) -> list[str]:
     return re.findall(r"\w+", text.lower())
 
 
-def _is_echo_of(user_text: str, agent_text: str) -> bool:
-    """True if a 'user' turn is substantially an echo of the agent's own line.
+def _longest_common_token_run(u: list[str], a: list[str]) -> int:
+    """Length of the longest run of CONSECUTIVE tokens common to both lists
+    (token-level longest common substring).
 
-    The agent's TTS bleeding back as user speech makes it re-ask its previous
-    question (the back-to-back "कब तक..." duplicate). We flag an echo only when
-    both lines are long enough to be confident (>= 4 tokens) and one is almost
-    entirely contained in the other (either direction, so a partial echo with a
-    few extra words like "कृपया बताएं ..." still counts) — while short genuine
-    replies (e.g. "हाँ", "पंद्रह June") are never dropped.
+    TTS bleed-back reproduces the agent's words *in order*, so it yields a long
+    contiguous run. A genuine reply that merely reuses a fragment (an amount or
+    date the agent just named) yields only a short run before diverging into the
+    customer's own words, so the run stays small.
+    """
+    if not u or not a:
+        return 0
+    prev = [0] * (len(a) + 1)
+    best = 0
+    for ui in u:
+        cur = [0] * (len(a) + 1)
+        for j, aj in enumerate(a, start=1):
+            if ui == aj:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best:
+                    best = cur[j]
+        prev = cur
+    return best
+
+
+def _is_echo_of(user_text: str, agent_text: str) -> bool:
+    """True only if a 'user' turn is the agent's own TTS bled back as speech.
+
+    True bleed-back is the agent's line RE-TRANSCRIBED VERBATIM, so the user
+    "turn" is almost entirely one contiguous copy of a span of the agent's line.
+    We measure the longest run of consecutive shared tokens and require it to
+    cover ~all of the user utterance.
+
+    The old check used bag-of-words overlap (`max(u_in_a, a_in_u) >= 0.8`), which
+    conflated shared *content* with bleed-back: in a collections call the agent
+    and customer inevitably share the amount phrase ("चार हज़ार रुपये की"), so a
+    genuine commitment like "मैं चार हज़ार रुपये की पेमेंट कर दूँगा" was flagged
+    and eaten. Contiguous-run keeps it — the customer's own verb tail ("...कर
+    दूँगा") breaks the copied run well below threshold — while a verbatim
+    re-transcription of the agent's sentence still matches end-to-end.
     """
     u = _content_tokens(user_text)
     a = _content_tokens(agent_text)
-    if len(u) < 4 or len(a) < 4:
+    if len(u) < 6 or len(a) < 4:
         return False
-    aset, uset = set(a), set(u)
-    u_in_a = sum(1 for t in u if t in aset) / len(u)
-    a_in_u = sum(1 for t in a if t in uset) / len(a)
-    return max(u_in_a, a_in_u) >= 0.8
+    run = _longest_common_token_run(u, a)
+    return run >= 6 and run / len(u) >= 0.85
 
 
 def _last_assistant_text(turn_ctx) -> str:
@@ -1295,6 +1408,13 @@ def _last_assistant_text(turn_ctx) -> str:
         if getattr(item, "role", None) == "assistant":
             return (getattr(item, "text_content", "") or "").strip()
     return ""
+
+
+# Spoken when the LLM call fails outright (e.g. Cerebras 429 token_quota_exceeded
+# after retries are exhausted). Without this the agent goes silent and the caller
+# has to speak again to un-stick it; a short hold line keeps the call alive and
+# invites the customer to repeat, which naturally triggers the next attempt.
+_LLM_FALLBACK_LINE = "जी, ज़रा एक सेकंड रुकिए... आप क्या कह रहे थे, फिर से बताइए?"
 
 
 class Assistant(Agent):
@@ -1334,29 +1454,47 @@ class Assistant(Agent):
 
         parts: list[str] = []
         carrier = None
-        async for chunk in base:
-            delta = getattr(chunk, "delta", None)
-            content = getattr(delta, "content", None) if delta is not None else None
-            tool_calls = (
-                getattr(delta, "tool_calls", None) if delta is not None else None
-            )
-            if tool_calls or not content:
-                yield chunk
-                continue
-            parts.append(content)
-            carrier = chunk
+        failed = False
+        try:
+            async for chunk in base:
+                delta = getattr(chunk, "delta", None)
+                content = getattr(delta, "content", None) if delta is not None else None
+                tool_calls = (
+                    getattr(delta, "tool_calls", None) if delta is not None else None
+                )
+                if tool_calls or not content:
+                    yield chunk
+                    continue
+                parts.append(content)
+                carrier = chunk
+        except Exception:
+            # The base node retries internally (e.g. the Cerebras 429 backoff);
+            # reaching here means retries were exhausted. Don't let the turn die
+            # silently — fall through and speak a fallback so the call recovers.
+            logger.exception(">>> LLM node failed after retries; speaking fallback")
+            failed = True
 
         if carrier is not None:
             full = "".join(parts)
-            cleaned = _collapse_repeated_text(_strip_process_narration(full))
+            cleaned = _collapse_repeated_text(
+                _strip_process_narration(_strip_stage_directions(full))
+            )
             if cleaned != full:
                 logger.warning(
                     ">>> LLM output cleaned (%d -> %d chars)", len(full), len(cleaned)
                 )
+                _dump_leak(chat_ctx, full, cleaned)
             if cleaned.strip():
                 carrier.delta.content = cleaned
                 yield carrier
             # else: the whole reply was a repeat / meta-narration — stay silent.
+        elif failed:
+            # Nothing was generated before the failure (typical for a 429 that
+            # fails before the first token): speak the hold line via TTS.
+            yield ChatChunk(
+                id="llm-fallback",
+                delta=ChoiceDelta(role="assistant", content=_LLM_FALLBACK_LINE),
+            )
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         """Drop a user turn that must not trigger a reply.
@@ -1511,7 +1649,7 @@ def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load(
         min_speech_duration=0.037,  # 100
         prefix_padding_duration=0.6,  # 200 ms speech pad
-        min_silence_duration=0.55,
+        min_silence_duration=0.35,
         activation_threshold=0.23,  # 200 ms silence pad
     )
 
@@ -1577,7 +1715,7 @@ async def my_agent(ctx: JobContext):
         # Capping max_delay to 1.5s removes ~1s of dead air per turn. Tradeoff:
         # a customer who pauses mid-sentence for >1.5s may be cut off — raise
         # this if that happens too often on live calls.
-        turn_handling={"endpointing": {"min_delay": 0.3, "max_delay": 0.8}},
+        turn_handling={"endpointing": {"min_delay": 0.3, "max_delay": 0.6}},
     )
 
     # NOTE: garbage/filler/duplicate STT filtering now lives in

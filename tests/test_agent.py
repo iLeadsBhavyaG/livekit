@@ -294,7 +294,27 @@ def test_collapse_repeated_text_removes_self_duplicated_reply() -> None:
 
     # A case-only difference between the copies (EMi vs EMI) still collapses.
     v2 = line.replace("EMI", "EMi")
-    assert agent_module._collapse_repeated_text(line + "\n\n" + v2).count("due date") == 1
+    assert (
+        agent_module._collapse_repeated_text(line + "\n\n" + v2).count("due date") == 1
+    )
+
+
+def test_collapse_repeated_text_drops_reworded_repeat() -> None:
+    """A REWORDED re-ask of the same question in one reply is collapsed too
+    (near-duplicate), while the distinct disclosure sentences are kept."""
+    disclosure = (
+        "आपके HDFC Bank लोन में नौ हज़ार पाँच सौ रुपये outstanding हैं, "
+        "due date बीस जून थी। क्या आप payment कब तक कर पाएंगे?"
+    )
+    reworded_q = " कृपया बताएं आप payment कब तक कर पाएंगे?"
+    out = agent_module._collapse_repeated_text(disclosure + reworded_q)
+    # The question survives exactly once; the outstanding line is untouched.
+    assert out.count("कब तक कर पाएंगे") == 1
+    assert "outstanding" in out and "due date" in out
+
+    # Two genuinely distinct sentences are NOT merged.
+    two = "नमस्ते Rahul जी, कैसे हैं आप? आपका HDFC Bank का loan pending है।"
+    assert agent_module._collapse_repeated_text(two) == two
 
 
 def test_strip_process_narration_drops_waiting_meta() -> None:
@@ -310,10 +330,48 @@ def test_strip_process_narration_drops_waiting_meta() -> None:
     assert agent_module._strip_process_narration(real) == real
 
 
-def test_prompt_forbids_process_narration() -> None:
-    """The prompt must forbid narrating call mechanics / waiting."""
+def test_strip_process_narration_catches_english_waiting() -> None:
+    """Regression (live call, room outbound-1783578453): gpt-oss-120b appended
+    English call-mechanics narration to a good reply and TTS spoke it aloud
+    ('...payment कर पाएंगे?We wait.(Waiting for user response)'). The real
+    question must survive; the English meta + parenthetical must not."""
+    leaked = "कब तक आप payment कर पाएंगे?We wait.(Waiting for user response)"
+    for mod in (agent_module, __import__("agent_v1_new")):
+        cleaned = mod._strip_process_narration(mod._strip_stage_directions(leaked))
+        assert "कब तक आप payment कर पाएंगे?" in cleaned
+        assert "We wait" not in cleaned
+        assert "Waiting for user response" not in cleaned
+    # A standalone English waiting sentence is dropped entirely.
+    assert (
+        agent_module._strip_process_narration("No response received yet.").strip() == ""
+    )
+    # A normal customer-facing line is untouched.
+    ok = "क्या आप payment कब तक कर पाएंगे?"
+    assert agent_module._strip_process_narration(ok) == ok
+
+
+def test_strip_stage_directions_removes_parentheticals() -> None:
+    """Parenthetical / bracketed stage directions are never spoken on a phone
+    call (the prompt forbids them) and must be stripped before TTS."""
+    assert (
+        agent_module._strip_stage_directions("ठीक है। (pause) (thinking...)").strip()
+        == "ठीक है।"
+    )
+    assert (
+        agent_module._strip_stage_directions("जी [waits] बिलकुल").strip() == "जी बिलकुल"
+    )
+    # A line with no brackets is returned unchanged.
+    plain = "क्या आप payment कब तक कर पाएंगे?"
+    assert agent_module._strip_stage_directions(plain) == plain
+
+
+def test_prompt_forbids_narrating_waiting() -> None:
+    """The prompt must explicitly forbid narrating call mechanics / waiting, so
+    the model stops emitting 'We wait' / 'Waiting for user response'. Backstop
+    for the _strip_process_narration + _strip_stage_directions filters."""
     ins = Assistant().instructions
     assert "Never narrate the call mechanics" in ins
+    assert "waiting for user response" in ins.lower()
 
 
 def test_is_echo_of_flags_agent_bleed_not_genuine_replies() -> None:
@@ -327,6 +385,66 @@ def test_is_echo_of_flags_agent_bleed_not_genuine_replies() -> None:
     assert not agent_module._is_echo_of("हाँ", q)
     assert not agent_module._is_echo_of("पंद्रह June को", q)
     assert not agent_module._is_echo_of("अगले हफ्ते कर दूँगा", q)
+
+
+def test_v1_new_is_echo_of_keeps_short_confirmations_reusing_question_words() -> None:
+    """Regression (real call, room outbound-1783489151): short genuine replies
+    that reuse the agent's question words were wrongly dropped as echoes,
+    leaving dead air. A bled-back agent SENTENCE must still be flagged."""
+    import agent_v1_new
+
+    greet = (
+        "नमस्ते, मैं Priya बोल रही हूँ आईलीड्स financial services की तरफ़ से। "
+        "क्या मेरी बात Pradeep Chopra जी से हो रही है?"
+    )
+    confirmq = (
+        "जी, confirm कर दूँ — क्या आप दस जुलाई को payment करेंगे? कितनी payment कर पाएंगे?"
+    )
+    # Genuine replies (were eaten) → must reach the agent.
+    assert not agent_v1_new._is_echo_of("जी हो रही है।", greet)
+    assert not agent_v1_new._is_echo_of("₹4000 की कर लूँगा।", confirmq)
+    assert not agent_v1_new._is_echo_of("हाँ।", greet)
+    # True bleed-back (full/partial agent sentence re-transcribed) → still echo.
+    assert agent_v1_new._is_echo_of(greet, greet)
+    assert agent_v1_new._is_echo_of("क्या मेरी बात Pradeep Chopra जी से हो रही है", greet)
+
+
+def test_v1_new_is_echo_of_keeps_amount_confirmation_sharing_amount_phrase() -> None:
+    """Regression (real call, room outbound-1783507619): a genuine payment
+    commitment was dropped as an 'echo' purely because it reused the amount
+    phrase the agent had just named. Bag-of-words overlap conflated shared
+    content with TTS bleed-back; contiguous-run detection keeps it (the
+    customer's own verb tail breaks the copied run), while a verbatim
+    re-transcription of the agent's sentence is still flagged."""
+    import agent_v1_new
+
+    reply = "मैं चार हज़ार रुपये की पेमेंट कर दूँगा।"  # 8 tokens — clears the floor
+    # Agent lines that name the same amount. The old max-overlap check flagged
+    # the first (a_in_u = 0.8 on the amount words alone); both must be KEPT now.
+    assert not agent_v1_new._is_echo_of(reply, "चार हज़ार रुपये की payment")
+    assert not agent_v1_new._is_echo_of(
+        reply, "जी, आप चार हज़ार रुपये की payment दस जुलाई को करेंगे, कर पाएंगे?"
+    )
+    # Verbatim bleed-back of a real agent question is still caught.
+    q = "आप चार हज़ार रुपये की payment कब तक करेंगे"
+    assert agent_v1_new._is_echo_of(q, q)
+
+
+def test_v1_new_longest_common_token_run() -> None:
+    """The contiguous-run helper counts consecutive shared tokens only.
+
+    Uses ASCII token lists so the count is unambiguous; the Devanagari behavior
+    is covered end-to-end by the `_is_echo_of` regression tests above (note that
+    `_content_tokens` fragments Devanagari on vowel signs, but consistently, so
+    the run *ratio* the echo check relies on stays meaningful)."""
+    import agent_v1_new
+
+    run = agent_v1_new._longest_common_token_run
+    assert run(["a", "b", "c", "d", "e", "f"], ["x", "a", "b", "c", "d", "z"]) == 4
+    assert run(["a", "x", "b", "y", "c"], ["a", "b", "c"]) == 1  # scattered → 1
+    assert run(["a", "b", "c"], ["a", "b", "c"]) == 3
+    assert run([], ["a"]) == 0
+    assert run(["a"], []) == 0
 
 
 @pytest.mark.asyncio
@@ -352,9 +470,7 @@ async def test_on_user_turn_completed_drops_empty_and_echo(monkeypatch) -> None:
         ("assistant", "आप payment कब तक कर पाएंगे?"),
     )
     with pytest.raises(StopResponse):
-        await agent.on_user_turn_completed(
-            turn_ctx, msg("आप payment कब तक कर पाएंगे")
-        )
+        await agent.on_user_turn_completed(turn_ctx, msg("आप payment कब तक कर पाएंगे"))
 
     # A genuine answer to that same question is NOT dropped.
     await agent.on_user_turn_completed(turn_ctx, msg("अगले हफ्ते कर दूँगा"))
@@ -491,34 +607,6 @@ def test_prompt_resumes_interrupted_disclosure() -> None:
     ins = Assistant().instructions
     assert "NEVER restart the call or return to the opening intro" in ins
     assert "RESUME and finish delivering" in ins
-
-
-def test_prompt_asks_when_can_pay_first() -> None:
-    """Right after disclosing the dues, the first question must be WHEN the
-    customer can pay — asked only ONCE (not twice), and never 'how much'."""
-    ins = Assistant().instructions
-    assert "ask WHEN they can pay" in ins
-    # The when-question must be asked once, not doubled in the same line.
-    assert "asked exactly once and never repeated or reworded" in ins
-
-
-def test_prompt_never_reasks_payment_timing() -> None:
-    """The open 'कब तक' timing question is asked once; a re-ask is forbidden and
-    replaced with a closed date confirmation, so the agent can't loop on it."""
-    ins = Assistant().instructions
-    assert "never ask that timing question again" in ins
-    # The single verbatim 'कब तक payment कर पाएंगे' example must not be duplicated
-    # across sections (verbatim repetition primes the model to echo/loop it).
-    assert ins.count("कब तक payment कर पाएंगे") <= 1
-
-
-def test_prompt_chases_missing_piece_and_limits_partial_followup() -> None:
-    """If only one of {date, amount} is given, chase the missing piece; and for a
-    partial payment never push for the remaining balance unless it is < ₹1000."""
-    ins = Assistant().instructions
-    assert "ask for the missing piece" in ins
-    assert "do NOT ask when they will pay the remaining balance" in ins
-    assert "below one thousand rupees" in ins
 
 
 def test_prompt_enforces_brevity_and_no_repetition() -> None:

@@ -31,3 +31,6 @@ KMS
 
 # GitHub CLI
 .github/personal-instructions.md
+
+# Local LLM leak captures (contains customer PII) — never commit
+llm_leaks.jsonl
